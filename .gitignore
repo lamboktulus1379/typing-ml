@@ -1,0 +1,90 @@
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.idea/
+.vscode/
+*.swp
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Virtual envs (if you ever use them)
+.venv/
+venv/
+
+# =========================
+# Conda
+# =========================
+# (Keep environment.yml tracked, ignore local conda stuff)
+.conda/
+conda-bld/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# =========================
+# Data (recommended: DON'T commit raw/processed datasets)
+# =========================
+data/raw/
+data/processed/
+
+# If you want to keep folder structure in git, add placeholder files:
+# (create empty files: data/raw/.gitkeep and data/processed/.gitkeep)
+# and then unignore them like below
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# =========================
+# Trained models / artifacts
+# =========================
+models/
+*.joblib
+*.pkl
+*.pickle
+
+# =========================
+# Reports outputs
+# =========================
+reports/figures/
+reports/*.json
+
+# Keep results.md tracked (experiment notes)
+!reports/results.md
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Optional: Notebooks output cleanup
+# =========================
+# If you want to keep notebooks but avoid committing huge outputs,
+# consider clearing outputs before commit (manual or with tools).
