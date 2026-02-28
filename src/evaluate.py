@@ -8,18 +8,30 @@ from joblib import load
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import ConfusionMatrixDisplay, classification_report
 
+
+def _load_model_artifact(model_path: str):
+    artifact = load(model_path)
+    if isinstance(artifact, dict) and "model" in artifact:
+        return artifact["model"], artifact
+    return artifact, None
+
 def main(data_path: str, model_path: str, fig_dir: str, random_state: int):
     df = pd.read_csv(data_path)
 
     target = "weakest_finger"
-    X = df.drop(columns=[target]).select_dtypes(include=["int64", "float64"])
+    model, artifact = _load_model_artifact(model_path)
+
+    if artifact and artifact.get("feature_names"):
+        feature_names = artifact["feature_names"]
+        X = df[feature_names]
+    else:
+        X = df.drop(columns=[target]).select_dtypes(include=["int64", "float64"])
     y = df[target]
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=random_state, stratify=y
     )
 
-    model = load(model_path)
     y_pred = model.predict(X_test)
 
     # Print report to console

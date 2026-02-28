@@ -2,7 +2,9 @@
 import os
 import json
 import argparse
+import datetime
 import pandas as pd
+from typing import Tuple
 
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -24,6 +26,7 @@ def main(data_path: str, model_out: str, report_out: str, random_state: int):
 
     # Keep only numeric features for first baseline (simple)
     X = X.select_dtypes(include=["int64", "float64"])
+    feature_names = list(X.columns)
 
     # --- Train/test split ---
     X_train, X_test, y_train, y_test = train_test_split(
@@ -42,9 +45,16 @@ def main(data_path: str, model_out: str, report_out: str, random_state: int):
     y_pred = model.predict(X_test)
     report = classification_report(y_test, y_pred, output_dict=True)
 
-    # --- Save model ---
+    # --- Save model artifact (model + metadata) ---
+    artifact = {
+        "model": model,
+        "feature_names": feature_names,
+        "target_name": target,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
     os.makedirs(os.path.dirname(model_out), exist_ok=True)
-    dump(model, model_out)
+    dump(artifact, model_out)
 
     # --- Save report JSON (for later use) ---
     os.makedirs(os.path.dirname(report_out), exist_ok=True)
