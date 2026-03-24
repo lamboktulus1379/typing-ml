@@ -1,4 +1,10 @@
-import pandas as pd, numpy as np, uuid, datetime, os
+import datetime
+import os
+import uuid
+from typing import Any
+
+import numpy as np
+import pandas as pd
 
 np.random.seed(7)
 
@@ -14,7 +20,7 @@ start = datetime.datetime(2025, 12, 5, 9, 0, 0)
 weak_list = fingers * 10
 np.random.shuffle(weak_list)
 
-rows = []
+rows: list[dict[str, Any]] = []
 idx = 0
 
 for u in range(1, n_users + 1):
@@ -30,7 +36,7 @@ for u in range(1, n_users + 1):
         wpm = float(np.clip(base_wpm + 0.35*s + np.random.normal(0, 4), 15, 140))
         accuracy = float(np.clip(base_acc + 0.0009*s + np.random.normal(0, 0.012), 0.70, 0.995))
 
-        errors = {}
+        errors: dict[str, float] = {}
         base_level = (1 - accuracy)
         for f in fingers:
             err = base_level*np.random.uniform(0.6, 1.1) + np.random.normal(0, 0.004)
@@ -38,11 +44,11 @@ for u in range(1, n_users + 1):
                 err += np.random.uniform(0.04, 0.10)
             errors[f] = float(np.clip(err, 0, 0.25))
 
-        mx = max(errors.values())
+        mx = max(list(errors.values()))
         if errors[weak] < mx:
             errors[weak] = float(np.clip(mx + 0.01, 0, 0.25))
 
-        row = {
+        row: dict[str, Any] = {
             "user_id": user_id,
             "session_id": session_id,
             "timestamp": ts.isoformat(timespec="seconds"),
@@ -52,6 +58,9 @@ for u in range(1, n_users + 1):
 
         for f in fingers:
             row[f"error_{f}"] = round(errors[f], 3)
+
+        # Aggregate per-finger error profile into one normalized session error-rate feature.
+        row["error_rate"] = round(sum(errors.values()) / len(errors), 4)
 
         row["weakest_finger"] = weak
         rows.append(row)
