@@ -2,7 +2,7 @@
 
 Beginner-friendly ML workflow for my thesis.
 
-**Phase 1:** Predict `weakest_finger` from typing session summary stats (WPM, accuracy, per-finger error rates).  
+**Phase 1:** Predict `weakest_finger` from typing session summary stats (WPM, accuracy, `error_rate`, and per-finger error rates).  
 **Phase 2:** Use predictions to recommend typing drills that target weak fingers.
 
 ---
@@ -39,7 +39,7 @@ Recommended sequence:
 1. Run `notebooks/01_eda.ipynb`
 2. Run `python src/train.py --data data/processed/dataset.csv`
 3. Run `python src/evaluate.py --data data/processed/dataset.csv --model models/model.joblib`
-4. (Optional) Run `uvicorn src.api:app --reload --port 8000` for prediction API
+4. (Optional) Run `make dev` for prediction API
 ---
 
 ## Repository Structure
@@ -68,6 +68,20 @@ conda install -y numpy pandas scikit-learn matplotlib seaborn jupyterlab joblib 
 
 ```bash
 conda env export > environment.yml
+```
+
+Makefile commands in this repo run through Conda by default (`typing-ml` env):
+
+```bash
+make install
+make dev
+make run
+```
+
+If your environment name is different:
+
+```bash
+make CONDA_ENV=<your-env-name> run
 ```
 
 ---
@@ -153,7 +167,7 @@ Expected file:
 
 Minimum columns:
 - `user_id`, `session_id`, `timestamp`
-- `wpm`, `accuracy`
+- `wpm`, `accuracy`, `error_rate`
 - `error_left_pinky`, `error_left_ring`, `error_left_middle`, `error_left_index`
 - `error_right_index`, `error_right_middle`, `error_right_ring`, `error_right_pinky`
 - `weakest_finger` (target label)
@@ -220,14 +234,14 @@ If you want to test your model through a REST endpoint (Postman/curl), use FastA
 Install (conda-forge):
 
 ```bash
-conda activate typing-ml
-conda install -y fastapi uvicorn -c conda-forge
+make install
 ```
 
 Run the API:
 
 ```bash
-uvicorn src.api:app --reload --port 8000
+make dev
+# or: make run
 ```
 
 Docs:
@@ -245,7 +259,7 @@ Predict (single row):
 ```bash
 curl -s http://127.0.0.1:8000/predict \
 	-H 'Content-Type: application/json' \
-	-d '{"features": {"wpm": 55, "accuracy": 0.93, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}}' \
+  -d '{"features": {"wpm": 55, "accuracy": 0.93, "error_rate": 0.07, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}}' \
 	| python -m json.tool
 ```
 

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+  "include": ["src"],
+  "exclude": [
+    "**/__pycache__",
+    "notebooks",
+    "reports",
+    "data"
+  ],
+  "typeCheckingMode": "strict",
+  "stubPath": "typings",
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "pythonVersion": "3.14"
+    }
+  ]
+}
