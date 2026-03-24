@@ -70,6 +70,7 @@ Request JSON shape:
   "features": {
     "wpm": 55,
     "accuracy": 0.93,
+    "error_rate": 0.07,
     "error_left_pinky": 0.02,
     "error_left_ring": 0.01,
     "error_left_middle": 0.01,
@@ -87,7 +88,7 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8000/predict \
   -H 'Content-Type: application/json' \
-  -d '{"features": {"wpm": 55, "accuracy": 0.93, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}}' \
+  -d '{"features": {"wpm": 55, "accuracy": 0.93, "error_rate": 0.07, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}}' \
   | python -m json.tool
 ```
 
@@ -104,8 +105,8 @@ Request JSON shape:
 ```json
 {
   "rows": [
-    {"wpm": 55, "accuracy": 0.93, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01},
-    {"wpm": 42, "accuracy": 0.91, "error_left_pinky": 0.01, "error_left_ring": 0.01, "error_left_middle": 0.02, "error_left_index": 0.01, "error_right_index": 0.03, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}
+    {"wpm": 55, "accuracy": 0.93, "error_rate": 0.07, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01},
+    {"wpm": 42, "accuracy": 0.91, "error_rate": 0.09, "error_left_pinky": 0.01, "error_left_ring": 0.01, "error_left_middle": 0.02, "error_left_index": 0.01, "error_right_index": 0.03, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01}
   ]
 }
 ```
