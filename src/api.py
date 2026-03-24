@@ -16,12 +16,12 @@ Then open:
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+import joblib
 from pydantic import BaseModel, Field
-from joblib import load
 
 
 def load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
@@ -34,13 +34,14 @@ def load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
 
     Old format (legacy): the sklearn Pipeline itself.
     """
-    artifact = load(model_path)
-    if isinstance(artifact, dict) and "model" in artifact:
-        model = artifact["model"]
+    raw_artifact: Any = cast(Any, joblib).load(model_path)
+    if isinstance(raw_artifact, dict) and "model" in raw_artifact:
+        artifact = cast(Dict[str, Any], raw_artifact)
+        model: Any = artifact["model"]
         return model, artifact
 
     # Backward compatibility: old joblib contained only the sklearn pipeline
-    model = artifact
+    model: Any = cast(Any, raw_artifact)
     feature_names = getattr(model, "feature_names_in_", None)
     meta: Dict[str, Any] = {
         "model": "<legacy_pipeline>",
@@ -111,7 +112,7 @@ def create_app() -> FastAPI:
         summary="Health check",
         description="Returns OK if the server is running.",
     )
-    def health() -> Dict[str, str]:
+    def health() -> Dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"status": "ok"}
 
     @app.get(
@@ -119,7 +120,7 @@ def create_app() -> FastAPI:
         summary="Model metadata",
         description="Returns required feature names, classes, and artifact info.",
     )
-    def metadata() -> Dict[str, Any]:
+    def metadata() -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         classes = getattr(getattr(model, "named_steps", {}).get("clf", model), "classes_", None)
         return {
             "model_path": model_path,
@@ -137,7 +138,7 @@ def create_app() -> FastAPI:
             "If the model supports predict_proba, class probabilities are returned too."
         ),
     )
-    def predict(req: PredictRequest) -> Dict[str, Any]:
+    def predict(req: PredictRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         X = build_frame([req.features])
 
         pred = model.predict(X)[0]
@@ -160,7 +161,7 @@ def create_app() -> FastAPI:
         summary="Predict weakest finger (batch)",
         description="Send multiple rows and get predictions (and optional probabilities).",
     )
-    def predict_batch(req: PredictBatchRequest) -> Dict[str, Any]:
+    def predict_batch(req: PredictBatchRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         if not req.rows:
             raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
 
