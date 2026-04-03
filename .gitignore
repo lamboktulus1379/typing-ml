@@ -73,7 +73,9 @@ models/
 # Reports outputs
 # =========================
 reports/figures/
+reports/figures_*/
 reports/*.json
+reports/results_filled_*.md
 
 # Keep results.md tracked (experiment notes)
 !reports/results.md
