@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, cast
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 import joblib
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 def load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
@@ -51,20 +51,39 @@ def load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
     return model, meta
 
 
+class TypingSessionData(BaseModel):
+    wpm: float
+    accuracy: float
+    error_left_pinky: float
+    error_left_ring: float
+    error_left_middle: float
+    error_left_index: float
+    error_right_index: float
+    error_right_middle: float
+    error_right_ring: float
+    error_right_pinky: float
+    dwell_left_pinky: float
+    dwell_left_ring: float
+    dwell_left_middle: float
+    dwell_left_index: float
+    dwell_right_index: float
+    dwell_right_middle: float
+    dwell_right_ring: float
+    dwell_right_pinky: float
+    flight_left_pinky: float
+    flight_left_ring: float
+    flight_left_middle: float
+    flight_left_index: float
+    flight_right_index: float
+    flight_right_middle: float
+    flight_right_ring: float
+    flight_right_pinky: float
+
 class PredictRequest(BaseModel):
-    """Request payload for single-row prediction."""
-
-    features: Dict[str, float] = Field(
-        ..., description="Numeric feature map, e.g. {'wpm': 55.2, 'accuracy': 0.93, ...}"
-    )
-
+    row: TypingSessionData
 
 class PredictBatchRequest(BaseModel):
-    """Request payload for batch prediction."""
-
-    rows: List[Dict[str, float]] = Field(
-        ..., description="List of feature maps, each like PredictRequest.features"
-    )
+    rows: List[TypingSessionData]
 
 
 def create_app() -> FastAPI:
@@ -139,7 +158,7 @@ def create_app() -> FastAPI:
         ),
     )
     def predict(req: PredictRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        X = build_frame([req.features])
+        X = build_frame([req.row.model_dump()])
 
         pred = model.predict(X)[0]
         result: Dict[str, Any] = {"prediction": pred}
@@ -165,7 +184,7 @@ def create_app() -> FastAPI:
         if not req.rows:
             raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
 
-        X = build_frame(req.rows)
+        X = build_frame([row.model_dump() for row in req.rows])
         preds = model.predict(X)
 
         out: Dict[str, Any] = {"predictions": [p for p in preds]}
