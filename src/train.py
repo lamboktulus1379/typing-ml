@@ -30,11 +30,45 @@ TRAIN_FEATURE_COLUMNS = [
     *FINGER_FLIGHT_COLUMNS
 ]
 
-def _build_feature_frame(df: pd.DataFrame, target: str) -> pd.DataFrame:
+FEATURE_RANGE_RULES: Dict[str, Tuple[float, float | None]] = {
+    "wpm": (0.0, None),
+    "accuracy": (0.0, 1.0),
+    **{name: (0.0, 1.0) for name in FINGER_ERROR_COLUMNS},
+    **{name: (0.0, None) for name in FINGER_DWELL_COLUMNS},
+    **{name: (0.0, None) for name in FINGER_FLIGHT_COLUMNS},
+}
+
+
+def _build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     missing_cols = [c for c in TRAIN_FEATURE_COLUMNS if c not in df.columns]
     if missing_cols:
         raise ValueError(f"Dataset is missing required columns: {missing_cols}")
-    return df[TRAIN_FEATURE_COLUMNS].copy()
+
+    feature_frame = df[TRAIN_FEATURE_COLUMNS].copy()
+    feature_frame = feature_frame.apply(pd.to_numeric, errors="coerce")
+
+    invalid_numeric_columns = feature_frame.columns[feature_frame.isna().any()].tolist()
+    if invalid_numeric_columns:
+        raise ValueError(
+            "Required feature columns contain null or non-numeric values: "
+            f"{invalid_numeric_columns}"
+        )
+
+    out_of_range_messages: list[str] = []
+    for col_name, (min_value, max_value) in FEATURE_RANGE_RULES.items():
+        col_values = feature_frame[col_name]
+        if (col_values < min_value).any():
+            out_of_range_messages.append(f"{col_name} < {min_value}")
+        if max_value is not None and (col_values > max_value).any():
+            out_of_range_messages.append(f"{col_name} > {max_value}")
+
+    if out_of_range_messages:
+        raise ValueError(
+            "Required feature columns contain out-of-range values: "
+            f"{out_of_range_messages}"
+        )
+
+    return feature_frame
 
 
 def _build_model_candidates(random_state: int) -> Dict[str, Pipeline]:
@@ -71,7 +105,12 @@ def main(
     df = pd.read_csv(data_path)
 
     target = "weakest_finger"
-    x_df = _build_feature_frame(df, target)
+    if target not in df.columns:
+        raise ValueError(
+            f"Dataset is missing required target column '{target}' needed for training."
+        )
+
+    x_df = _build_feature_frame(df)
     y = df[target]
 
     split_fn = cast(
@@ -131,10 +170,14 @@ def main(
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
-    os.makedirs(os.path.dirname(model_out), exist_ok=True)
+    model_out_dir = os.path.dirname(model_out)
+    if model_out_dir:
+        os.makedirs(model_out_dir, exist_ok=True)
     cast(Any, joblib).dump(artifact, model_out)
 
-    os.makedirs(os.path.dirname(report_out), exist_ok=True)
+    report_out_dir = os.path.dirname(report_out)
+    if report_out_dir:
+        os.makedirs(report_out_dir, exist_ok=True)
     with open(report_out, "w") as f:
         json.dump(report, f, indent=2)
 

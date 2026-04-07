@@ -103,6 +103,17 @@ if ! command -v conda >/dev/null 2>&1; then
   exit 1
 fi
 
+conda_env_exists() {
+  conda env list 2>/dev/null | awk 'NR>2 {print $1}' | grep -Fxq "$1"
+}
+
+if ! conda_env_exists "$CONDA_ENV_NAME"; then
+  echo "Error: Conda environment '$CONDA_ENV_NAME' does not exist."
+  echo "Create it first, for example:"
+  echo "  conda env create -n \"$CONDA_ENV_NAME\" -f environment.yml"
+  exit 1
+fi
+
 echo "=== Typing-ML Beginner Flow ==="
 echo "Project root: $ROOT_DIR"
 echo "Conda env:    $CONDA_ENV_NAME"

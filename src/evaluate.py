@@ -11,15 +11,36 @@ import sklearn.model_selection as sk_model_selection
 def _load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
     """Loads the saved model and its metadata."""
     raw_artifact: Any = cast(Any, joblib).load(model_path)
-    if isinstance(raw_artifact, dict) and "model" in raw_artifact:
-        return raw_artifact["model"], cast(Dict[str, Any], raw_artifact)
-    raise ValueError("Model artifact is not in the expected dictionary format.")
+    if isinstance(raw_artifact, dict):
+        artifact = cast(Dict[str, Any], raw_artifact)
+        if "model" in artifact:
+            return artifact["model"], artifact
 
-def _select_features(df: pd.DataFrame, target: str, artifact: Dict[str, Any]) -> pd.DataFrame:
+    legacy_model = cast(Any, raw_artifact)
+    if hasattr(legacy_model, "predict"):
+        artifact: Dict[str, Any] = {}
+        feature_names_in = getattr(legacy_model, "feature_names_in_", None)
+        if feature_names_in is not None and hasattr(feature_names_in, "tolist"):
+            artifact["feature_names"] = list(feature_names_in)
+        return legacy_model, artifact
+
+    raise ValueError(
+        "Model artifact is neither a dict containing 'model' nor a legacy "
+        "predictable model object. Re-train with src/train.py to generate "
+        "the current dict-based artifact format."
+    )
+
+def _select_features(df: pd.DataFrame, artifact: Dict[str, Any]) -> pd.DataFrame:
     """Dynamically extracts the exact 26 features the model was trained on."""
-    expected_features = artifact.get("feature_names", [])
+    expected_features_raw = artifact.get("feature_names", [])
+    expected_features = cast(list[str], expected_features_raw)
     if not expected_features:
-        raise ValueError("Artifact does not contain 'feature_names'.")
+        raise ValueError(
+            "Artifact does not contain 'feature_names'. This can happen with "
+            "legacy model-only artifacts that do not expose schema metadata. "
+            "Re-train with src/train.py to generate a dict artifact that includes "
+            "feature_names."
+        )
 
     missing = [c for c in expected_features if c not in df.columns]
     if missing:
@@ -32,10 +53,15 @@ def main(data_path: str, model_path: str, fig_dir: str, random_state: int = 42) 
     df = pd.read_csv(data_path)
 
     target = "weakest_finger"
+    if target not in df.columns:
+        raise ValueError(
+            f"Evaluation dataset is missing required target column '{target}'."
+        )
+
     model, artifact = _load_model_artifact(model_path)
 
     # Automatically extracts the 26 features
-    x_df = _select_features(df, target, artifact)
+    x_df = _select_features(df, artifact)
     y = df[target]
 
     split_fn = cast(
@@ -43,7 +69,7 @@ def main(data_path: str, model_path: str, fig_dir: str, random_state: int = 42) 
         cast(Any, sk_model_selection).train_test_split,
     )
 
-    # We use the exact same random_state=42 so we test on the exact same hidden 20%
+    # We use the provided random_state so we evaluate on a consistent split for that seed.
     _, x_test, _, y_test = split_fn(
         x_df, y, test_size=0.2, random_state=random_state, stratify=y
     )
