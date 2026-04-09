@@ -4,6 +4,7 @@ import argparse
 import datetime
 from typing import Any, Callable, Dict, Tuple, cast
 import pandas as pd
+import numpy as np
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -38,6 +39,8 @@ FEATURE_RANGE_RULES: Dict[str, Tuple[float, float | None]] = {
     **{name: (0.0, None) for name in FINGER_FLIGHT_COLUMNS},
 }
 
+ALLOWED_WEAKEST_FINGER_LABELS = set(FINGERS)
+
 
 def _build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     missing_cols = [c for c in TRAIN_FEATURE_COLUMNS if c not in df.columns]
@@ -45,6 +48,9 @@ def _build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Dataset is missing required columns: {missing_cols}")
 
     feature_frame = df[TRAIN_FEATURE_COLUMNS].copy()
+    if feature_frame.empty:
+        raise ValueError("Dataset contains zero rows after feature selection.")
+
     feature_frame = feature_frame.apply(pd.to_numeric, errors="coerce")
 
     invalid_numeric_columns = feature_frame.columns[feature_frame.isna().any()].tolist()
@@ -52,6 +58,12 @@ def _build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(
             "Required feature columns contain null or non-numeric values: "
             f"{invalid_numeric_columns}"
+        )
+
+    # Explicitly reject +/-inf values; these can silently pass numeric conversion.
+    if not np.isfinite(feature_frame.to_numpy(dtype=float)).all():
+        raise ValueError(
+            "Required feature columns contain non-finite values (inf or -inf)."
         )
 
     out_of_range_messages: list[str] = []
@@ -69,6 +81,44 @@ def _build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return feature_frame
+
+
+def _build_target_series(df: pd.DataFrame, target: str) -> pd.Series:
+    raw_target = df[target]
+
+    if raw_target.isna().any():
+        raise ValueError(
+            f"Target column '{target}' contains null values; fill or remove them first."
+        )
+
+    target_series = raw_target.astype(str).str.strip()
+    if (target_series == "").any():
+        raise ValueError(
+            f"Target column '{target}' contains blank string labels; fix input labels first."
+        )
+
+    invalid_labels = sorted(set(target_series.unique()) - ALLOWED_WEAKEST_FINGER_LABELS)
+    if invalid_labels:
+        raise ValueError(
+            f"Target column '{target}' contains unsupported labels: {invalid_labels}. "
+            f"Allowed labels: {sorted(ALLOWED_WEAKEST_FINGER_LABELS)}"
+        )
+
+    class_counts = target_series.value_counts()
+    if class_counts.size < 2:
+        raise ValueError(
+            f"Target column '{target}' must contain at least 2 classes for training. "
+            f"Found classes: {class_counts.to_dict()}"
+        )
+
+    sparse_classes = class_counts[class_counts < 2]
+    if not sparse_classes.empty:
+        raise ValueError(
+            "Each class must have at least 2 rows for stratified train/test split. "
+            f"Sparse classes: {sparse_classes.to_dict()}"
+        )
+
+    return target_series
 
 
 def _build_model_candidates(random_state: int) -> Dict[str, Pipeline]:
@@ -104,6 +154,9 @@ def main(
     print(f"Loading data from {data_path}...")
     df = pd.read_csv(data_path)
 
+    if df.empty:
+        raise ValueError("Training dataset is empty. Provide at least one row.")
+
     target = "weakest_finger"
     if target not in df.columns:
         raise ValueError(
@@ -111,15 +164,21 @@ def main(
         )
 
     x_df = _build_feature_frame(df)
-    y = df[target]
+    y = _build_target_series(df, target)
 
     split_fn = cast(
         Callable[..., Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]],
         cast(Any, sk_model_selection).train_test_split,
     )
-    x_train, x_test, y_train, y_test = split_fn(
-        x_df, y, test_size=0.2, random_state=random_state, stratify=y
-    )
+    try:
+        x_train, x_test, y_train, y_test = split_fn(
+            x_df, y, test_size=0.2, random_state=random_state, stratify=y
+        )
+    except ValueError as ex:
+        raise ValueError(
+            "Failed to create stratified train/test split. "
+            f"Class distribution: {y.value_counts().to_dict()}"
+        ) from ex
 
     candidates = _build_model_candidates(random_state)
     if model_type == "auto":

@@ -40,6 +40,12 @@ Recommended sequence:
 2. Run `python src/train.py --data data/processed/dataset.csv`
 3. Run `python src/evaluate.py --data data/processed/dataset.csv --model models/model.joblib`
 4. (Optional) Run `make dev` for prediction API
+
+Validation guardrails in `train.py` and `evaluate.py`:
+- Required feature columns must exist and be numeric.
+- Feature values must be finite (no `inf`/`-inf`) and within expected ranges.
+- Target labels must be one of the 8 finger classes.
+- Target must have at least 2 classes and at least 2 rows per class (for stratified split).
 ---
 
 ## Repository Structure
@@ -103,6 +109,18 @@ Useful options:
 ```bash
 bash scripts/beginner_flow.sh --help
 ```
+
+`scripts/beginner_flow.sh` validates CLI inputs before running:
+- `--users` and `--sessions` must be positive integers.
+- `--seed` must be an integer.
+- `--model-type` must be `auto`, `logistic_regression`, or `random_forest`.
+- Path arguments must be non-empty.
+
+At the end of the flow, it also verifies expected artifacts exist:
+- `data/processed/dataset.csv`
+- `models/model.joblib`
+- `reports/training_report.json`
+- `reports/figures/confusion_matrix.png`
 
 Makefile commands in this repo run through Conda by default (`typing-ml` env):
 
@@ -209,6 +227,8 @@ This reflects the thesis-valid feature set (including dwell time and flight time
 ### 4. Data Preparation
 
 - Validate required columns and numeric ranges.
+- Reject non-finite feature values (`inf`, `-inf`).
+- Validate target labels and minimum per-class sample counts for stratified split.
 - Split dataset into train and test with stratification.
 - Use a fixed random seed for reproducibility.
 

@@ -3,10 +3,30 @@ import argparse
 from typing import Any, Callable, Dict, Tuple, cast
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 import joblib
 import sklearn.metrics as sk_metrics
 import sklearn.model_selection as sk_model_selection
+
+FINGERS = [
+    "left_pinky", "left_ring", "left_middle", "left_index",
+    "right_index", "right_middle", "right_ring", "right_pinky"
+]
+
+FINGER_ERROR_COLUMNS = [f"error_{f}" for f in FINGERS]
+FINGER_DWELL_COLUMNS = [f"dwell_{f}" for f in FINGERS]
+FINGER_FLIGHT_COLUMNS = [f"flight_{f}" for f in FINGERS]
+
+ALLOWED_WEAKEST_FINGER_LABELS = set(FINGERS)
+
+FEATURE_RANGE_RULES: Dict[str, Tuple[float, float | None]] = {
+    "wpm": (0.0, None),
+    "accuracy": (0.0, 1.0),
+    **{name: (0.0, 1.0) for name in FINGER_ERROR_COLUMNS},
+    **{name: (0.0, None) for name in FINGER_DWELL_COLUMNS},
+    **{name: (0.0, None) for name in FINGER_FLIGHT_COLUMNS},
+}
 
 def _load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
     """Loads the saved model and its metadata."""
@@ -30,6 +50,82 @@ def _load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
         "the current dict-based artifact format."
     )
 
+
+def _validate_feature_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
+    if feature_frame.empty:
+        raise ValueError("Evaluation feature frame is empty.")
+
+    validated = feature_frame.apply(pd.to_numeric, errors="coerce")
+
+    invalid_numeric_columns = validated.columns[validated.isna().any()].tolist()
+    if invalid_numeric_columns:
+        raise ValueError(
+            "Evaluation features contain null or non-numeric values in columns: "
+            f"{invalid_numeric_columns}"
+        )
+
+    if not np.isfinite(validated.to_numpy(dtype=float)).all():
+        raise ValueError(
+            "Evaluation features contain non-finite values (inf or -inf)."
+        )
+
+    out_of_range_messages: list[str] = []
+    for col_name, (min_value, max_value) in FEATURE_RANGE_RULES.items():
+        if col_name not in validated.columns:
+            # Model may be legacy or trained on different schema; we only validate known columns present.
+            continue
+        col_values = validated[col_name]
+        if (col_values < min_value).any():
+            out_of_range_messages.append(f"{col_name} < {min_value}")
+        if max_value is not None and (col_values > max_value).any():
+            out_of_range_messages.append(f"{col_name} > {max_value}")
+
+    if out_of_range_messages:
+        raise ValueError(
+            "Evaluation features contain out-of-range values: "
+            f"{out_of_range_messages}"
+        )
+
+    return validated
+
+
+def _build_target_series(df: pd.DataFrame, target: str) -> pd.Series:
+    raw_target = df[target]
+
+    if raw_target.isna().any():
+        raise ValueError(
+            f"Evaluation target column '{target}' contains null values."
+        )
+
+    target_series = raw_target.astype(str).str.strip()
+    if (target_series == "").any():
+        raise ValueError(
+            f"Evaluation target column '{target}' contains blank labels."
+        )
+
+    invalid_labels = sorted(set(target_series.unique()) - ALLOWED_WEAKEST_FINGER_LABELS)
+    if invalid_labels:
+        raise ValueError(
+            f"Evaluation target column '{target}' contains unsupported labels: {invalid_labels}. "
+            f"Allowed labels: {sorted(ALLOWED_WEAKEST_FINGER_LABELS)}"
+        )
+
+    class_counts = target_series.value_counts()
+    if class_counts.size < 2:
+        raise ValueError(
+            f"Evaluation target column '{target}' must contain at least 2 classes. "
+            f"Found classes: {class_counts.to_dict()}"
+        )
+
+    sparse_classes = class_counts[class_counts < 2]
+    if not sparse_classes.empty:
+        raise ValueError(
+            "Each class in evaluation target must have at least 2 rows for stratified split. "
+            f"Sparse classes: {sparse_classes.to_dict()}"
+        )
+
+    return target_series
+
 def _select_features(df: pd.DataFrame, artifact: Dict[str, Any]) -> pd.DataFrame:
     """Dynamically extracts the exact 26 features the model was trained on."""
     expected_features_raw = artifact.get("feature_names", [])
@@ -46,11 +142,15 @@ def _select_features(df: pd.DataFrame, artifact: Dict[str, Any]) -> pd.DataFrame
     if missing:
         raise ValueError(f"Evaluation dataset is missing required features: {missing}")
 
-    return df[expected_features].copy()
+    selected = df[expected_features].copy()
+    return _validate_feature_frame(selected)
 
 def main(data_path: str, model_path: str, fig_dir: str, random_state: int = 42) -> None:
     print(f"Loading evaluation dataset from {data_path}...")
     df = pd.read_csv(data_path)
+
+    if df.empty:
+        raise ValueError("Evaluation dataset is empty. Provide at least one row.")
 
     target = "weakest_finger"
     if target not in df.columns:
@@ -58,11 +158,14 @@ def main(data_path: str, model_path: str, fig_dir: str, random_state: int = 42) 
             f"Evaluation dataset is missing required target column '{target}'."
         )
 
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model artifact not found: {model_path}")
+
     model, artifact = _load_model_artifact(model_path)
 
     # Automatically extracts the 26 features
     x_df = _select_features(df, artifact)
-    y = df[target]
+    y = _build_target_series(df, target)
 
     split_fn = cast(
         Callable[..., Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]],
@@ -70,9 +173,15 @@ def main(data_path: str, model_path: str, fig_dir: str, random_state: int = 42) 
     )
 
     # We use the provided random_state so we evaluate on a consistent split for that seed.
-    _, x_test, _, y_test = split_fn(
-        x_df, y, test_size=0.2, random_state=random_state, stratify=y
-    )
+    try:
+        _, x_test, _, y_test = split_fn(
+            x_df, y, test_size=0.2, random_state=random_state, stratify=y
+        )
+    except ValueError as ex:
+        raise ValueError(
+            "Failed to create stratified evaluation split. "
+            f"Class distribution: {y.value_counts().to_dict()}"
+        ) from ex
 
     print("Generating predictions...")
     y_pred = model.predict(x_test)
