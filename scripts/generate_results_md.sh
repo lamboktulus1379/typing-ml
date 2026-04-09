@@ -38,6 +38,21 @@ seed_value = sys.argv[6]
 with report_json.open("r", encoding="utf-8") as f:
     report = json.load(f)
 
+required_top_level = ["selected_model", "accuracy", "macro avg", "weighted avg"]
+missing_top_level = [k for k in required_top_level if k not in report]
+if missing_top_level:
+    raise SystemExit(
+        "Training report is missing required keys: "
+        f"{missing_top_level}. Re-run training first."
+    )
+
+for aggregate_key in ("macro avg", "weighted avg"):
+    if not isinstance(report.get(aggregate_key), dict):
+        raise SystemExit(
+            f"Training report key '{aggregate_key}' must be an object. "
+            "Re-run training to regenerate report JSON."
+        )
+
 with dataset_csv.open("r", encoding="utf-8", newline="") as f:
     row_count = sum(1 for _ in csv.reader(f)) - 1
 if row_count < 0:
@@ -48,6 +63,10 @@ accuracy = float(report.get("accuracy", 0.0))
 macro = report.get("macro avg", {})
 weighted = report.get("weighted avg", {})
 candidates = report.get("candidate_accuracies", {})
+if candidates is not None and not isinstance(candidates, dict):
+    raise SystemExit(
+        "Training report key 'candidate_accuracies' must be an object when present."
+    )
 
 classes = [
     "left_pinky", "left_ring", "left_middle", "left_index",

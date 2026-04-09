@@ -44,6 +44,53 @@ Examples:
 EOF
 }
 
+is_positive_int() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_integer() {
+  [[ "$1" =~ ^-?[0-9]+$ ]]
+}
+
+validate_inputs() {
+  if ! is_positive_int "$N_USERS_VALUE"; then
+    echo "Error: --users must be a positive integer, got: $N_USERS_VALUE"
+    exit 1
+  fi
+
+  if ! is_positive_int "$SESSIONS_PER_USER_VALUE"; then
+    echo "Error: --sessions must be a positive integer, got: $SESSIONS_PER_USER_VALUE"
+    exit 1
+  fi
+
+  if ! is_integer "$SEED_VALUE"; then
+    echo "Error: --seed must be an integer, got: $SEED_VALUE"
+    exit 1
+  fi
+
+  case "$MODEL_TYPE_VALUE" in
+    auto|logistic_regression|random_forest) ;;
+    *)
+      echo "Error: --model-type must be one of: auto, logistic_regression, random_forest"
+      echo "       Received: $MODEL_TYPE_VALUE"
+      exit 1
+      ;;
+  esac
+
+  for value_and_name in \
+    "$DATA_PATH_VALUE:--data-path" \
+    "$MODEL_PATH_VALUE:--model-path" \
+    "$REPORT_PATH_VALUE:--report-path" \
+    "$FIG_DIR_VALUE:--fig-dir"; do
+    value="${value_and_name%%:*}"
+    name="${value_and_name##*:}"
+    if [[ -z "${value// }" ]]; then
+      echo "Error: $name must be a non-empty path"
+      exit 1
+    fi
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env)
@@ -97,6 +144,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+validate_inputs
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "Error: conda command not found. Install Miniconda/Conda first."
@@ -158,9 +207,25 @@ make \
   SEED="$SEED_VALUE" \
   evaluate
 
+EXPECTED_FIGURE="$FIG_DIR_VALUE/confusion_matrix.png"
+missing_artifacts=()
+[[ -f "$DATA_PATH_VALUE" ]] || missing_artifacts+=("$DATA_PATH_VALUE")
+[[ -f "$MODEL_PATH_VALUE" ]] || missing_artifacts+=("$MODEL_PATH_VALUE")
+[[ -f "$REPORT_PATH_VALUE" ]] || missing_artifacts+=("$REPORT_PATH_VALUE")
+[[ -f "$EXPECTED_FIGURE" ]] || missing_artifacts+=("$EXPECTED_FIGURE")
+
+if (( ${#missing_artifacts[@]} > 0 )); then
+  echo ""
+  echo "Error: flow completed but expected artifacts were not found:"
+  for artifact in "${missing_artifacts[@]}"; do
+    echo "- $artifact"
+  done
+  exit 1
+fi
+
 echo ""
 echo "Done. Artifacts generated:"
 echo "- Dataset:   $DATA_PATH_VALUE"
 echo "- Model:     $MODEL_PATH_VALUE"
 echo "- Report:    $REPORT_PATH_VALUE"
-echo "- Figures:   $FIG_DIR_VALUE"
+echo "- Figures:   $EXPECTED_FIGURE"

@@ -25,6 +25,13 @@ def generate_dataset(
     sessions_per_user: int,
     seed: int,
 ) -> pd.DataFrame:
+    if n_users <= 0:
+        raise ValueError(f"n_users must be > 0, got {n_users}")
+    if sessions_per_user <= 0:
+        raise ValueError(
+            f"sessions_per_user must be > 0, got {sessions_per_user}"
+        )
+
     rng = np.random.default_rng(seed)
     start = datetime.datetime(2025, 12, 1, 9, 0, 0)
     rows: list[dict[str, Any]] = []
@@ -88,6 +95,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="data/processed/dataset.csv")
     args = parser.parse_args()
+
+    if args.n_users <= 0:
+        raise ValueError(f"--n-users must be > 0, got {args.n_users}")
+    if args.sessions_per_user <= 0:
+        raise ValueError(
+            f"--sessions-per-user must be > 0, got {args.sessions_per_user}"
+        )
+    if not str(args.output).strip():
+        raise ValueError("--output must be a non-empty path")
 
     df = generate_dataset(args.n_users, args.sessions_per_user, args.seed)
     output_path = args.output
