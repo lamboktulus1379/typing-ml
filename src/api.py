@@ -19,13 +19,17 @@ import os
 import logging
 import json
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-import joblib
 from pydantic import BaseModel
+
+try:
+    from src.ml_pipeline.artifacts import ArtifactStore
+except ModuleNotFoundError:
+    from ml_pipeline.artifacts import ArtifactStore
 
 
 MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "4096"))
@@ -33,6 +37,8 @@ logger = logging.getLogger("typing-ml")
 
 
 def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS) -> str:
+    """Convert payload to text and cap it to avoid oversized trace attributes."""
+
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
     if len(text) <= max_chars:
         return text
@@ -40,6 +46,8 @@ def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS)
 
 
 def compact_json_if_possible(payload: str) -> str:
+    """Return compact JSON when payload is valid JSON, otherwise unchanged text."""
+
     try:
         return json.dumps(json.loads(payload), separators=(",", ":"))
     except json.JSONDecodeError:
@@ -100,34 +108,92 @@ def start_model_inference_span(span_name: str, row_count: int, feature_count: in
     )
 
 
-def load_model_artifact(model_path: str) -> tuple[Any, Dict[str, Any]]:
-    """Load a model artifact from disk.
+class InferenceService:
+    """Application service for schema-aware inference and metadata access."""
 
-    New format (recommended): a dict containing:
-    - model: sklearn estimator or Pipeline
-    - feature_names: list[str] used in training
-    - target_name: name of the prediction target
+    def __init__(self, model: Any, artifact: Dict[str, Any], model_path: str) -> None:
+        self.model = model
+        self.artifact = artifact
+        self.model_path = model_path
+        self.feature_names: Optional[List[str]] = artifact.get("feature_names")
 
-    Old format (legacy): the sklearn Pipeline itself.
-    """
-    raw_artifact: Any = cast(Any, joblib).load(model_path)
-    if isinstance(raw_artifact, dict) and "model" in raw_artifact:
-        artifact = cast(Dict[str, Any], raw_artifact)
-        model: Any = artifact["model"]
-        return model, artifact
+    def build_frame(self, rows: List[Dict[str, float]]) -> pd.DataFrame:
+        """Build a prediction frame and enforce training feature schema when available."""
 
-    # Backward compatibility: old joblib contained only the sklearn pipeline
-    model: Any = cast(Any, raw_artifact)
-    feature_names = getattr(model, "feature_names_in_", None)
-    meta: Dict[str, Any] = {
-        "model": "<legacy_pipeline>",
-        "feature_names": list(feature_names) if feature_names is not None else None,
-        "target_name": "weakest_finger",
-    }
-    return model, meta
+        if self.feature_names:
+            missing = sorted({k for k in self.feature_names if any(k not in r for r in rows)})
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Missing required features",
+                        "missing": missing,
+                    },
+                )
+            return pd.DataFrame(rows, columns=self.feature_names)
+
+        all_keys = sorted({k for r in rows for k in r.keys()})
+        return pd.DataFrame(rows, columns=all_keys)
+
+    def get_metadata(self) -> Dict[str, Any]:
+        """Return metadata used by clients to shape prediction requests."""
+
+        classes = getattr(getattr(self.model, "named_steps", {}).get("clf", self.model), "classes_", None)
+        classes_list = list(classes) if classes is not None else None
+        return {
+            "model_path": self.model_path,
+            "target_name": self.artifact.get("target_name", "weakest_finger"),
+            "feature_names": self.feature_names,
+            "classes": classes_list,
+            "created_at": self.artifact.get("created_at"),
+        }
+
+    def predict_one(self, row: Dict[str, float]) -> Dict[str, Any]:
+        """Predict one row and optionally include class probabilities."""
+
+        dataframe = self.build_frame([row])
+        prediction = self.model.predict(dataframe)[0]
+        result: Dict[str, Any] = {"prediction": prediction}
+
+        has_predict_proba = hasattr(self.model, "predict_proba")
+        if has_predict_proba:
+            probs = self.model.predict_proba(dataframe)[0]
+            classes = getattr(self.model, "classes_", None)
+            if classes is None:
+                clf = getattr(self.model, "named_steps", {}).get("clf")
+                classes = getattr(clf, "classes_", None)
+            if classes is not None:
+                result["probabilities"] = {str(c): float(p) for c, p in zip(classes, probs)}
+
+        return result
+
+    def predict_many(self, rows: List[Dict[str, float]]) -> Dict[str, Any]:
+        """Predict many rows and optionally include class probabilities per row."""
+
+        if not rows:
+            raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
+
+        dataframe = self.build_frame(rows)
+        predictions = self.model.predict(dataframe)
+        out: Dict[str, Any] = {"predictions": [p for p in predictions]}
+
+        has_predict_proba = hasattr(self.model, "predict_proba")
+        if has_predict_proba:
+            probas = self.model.predict_proba(dataframe)
+            clf = getattr(self.model, "named_steps", {}).get("clf", self.model)
+            classes = getattr(clf, "classes_", None)
+            if classes is not None:
+                out["probabilities"] = [
+                    {str(c): float(p) for c, p in zip(classes, row_probs)}
+                    for row_probs in probas
+                ]
+
+        return out
 
 
 class TypingSessionData(BaseModel):
+    """Input feature schema for one typing session."""
+
     wpm: float
     accuracy: float
     error_left_pinky: float
@@ -156,9 +222,13 @@ class TypingSessionData(BaseModel):
     flight_right_pinky: float
 
 class PredictRequest(BaseModel):
+    """Single-row prediction request payload."""
+
     row: TypingSessionData
 
 class PredictBatchRequest(BaseModel):
+    """Batch prediction request payload."""
+
     rows: List[TypingSessionData]
 
 
@@ -181,6 +251,8 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def trace_payload_middleware(request: Request, call_next):
+        """Capture request/response payload snippets for logs and optional tracing."""
+
         raw_request_body = await request.body()
 
         async def receive() -> dict[str, Any]:
@@ -229,35 +301,13 @@ def create_app() -> FastAPI:
         )
 
     model_path = os.getenv("TYPING_ML_MODEL_PATH", "models/model.joblib")
+    artifact_store = ArtifactStore()
     with start_model_internal_span("typing-ml.model.load", attributes={"typing.ml.model.path": model_path}) as span:
-        model, artifact = load_model_artifact(model_path)
+        model, artifact = artifact_store.load_model_artifact(model_path)
         if span is not None and span.is_recording():
             span.set_attribute("typing.ml.model.class", model.__class__.__name__)
 
-    feature_names: Optional[List[str]] = artifact.get("feature_names")
-
-    def build_frame(rows: List[Dict[str, float]]) -> pd.DataFrame:
-        """Convert incoming JSON feature maps into a pandas DataFrame.
-
-        If the artifact provides feature_names, we require all of them and keep
-        the exact column order from training.
-        """
-        if feature_names:
-            missing = sorted({k for k in feature_names if any(k not in r for r in rows)})
-            if missing:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "Missing required features",
-                        "missing": missing,
-                    },
-                )
-            # Build in exact training column order
-            return pd.DataFrame(rows, columns=feature_names)
-
-        # No saved schema: best-effort ordering by sorted keys
-        all_keys = sorted({k for r in rows for k in r.keys()})
-        return pd.DataFrame(rows, columns=all_keys)
+    inference_service = InferenceService(model, artifact, model_path)
 
     @app.get(
         "/health",
@@ -265,6 +315,8 @@ def create_app() -> FastAPI:
         description="Returns OK if the server is running.",
     )
     def health() -> Dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Lightweight liveness endpoint."""
+
         return {"status": "ok"}
 
     @app.get(
@@ -273,22 +325,19 @@ def create_app() -> FastAPI:
         description="Returns required feature names, classes, and artifact info.",
     )
     def metadata() -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Expose model schema and class metadata for API clients."""
+
         with start_model_internal_span("typing-ml.model.metadata") as span:
-            classes = getattr(getattr(model, "named_steps", {}).get("clf", model), "classes_", None)
-            classes_list = list(classes) if classes is not None else None
+            metadata_payload = inference_service.get_metadata()
+            classes_list = metadata_payload.get("classes")
+            feature_names = metadata_payload.get("feature_names")
 
             if span is not None and span.is_recording():
                 span.set_attribute("typing.ml.model.class", model.__class__.__name__)
                 span.set_attribute("typing.ml.model.feature_count", len(feature_names) if feature_names else 0)
                 span.set_attribute("typing.ml.model.class_count", len(classes_list) if classes_list else 0)
 
-            return {
-                "model_path": model_path,
-                "target_name": artifact.get("target_name", "weakest_finger"),
-                "feature_names": feature_names,
-                "classes": classes_list,
-                "created_at": artifact.get("created_at"),
-            }
+            return metadata_payload
 
     @app.post(
         "/predict",
@@ -299,22 +348,15 @@ def create_app() -> FastAPI:
         ),
     )
     def predict(req: PredictRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        X = build_frame([req.row.model_dump()])
+        """Predict weakest finger for a single input row."""
 
-        with start_model_inference_span("typing-ml.model.predict", row_count=1, feature_count=len(X.columns)) as span:
-            pred = model.predict(X)[0]
-            result: Dict[str, Any] = {"prediction": pred}
+        row_payload = req.row.model_dump()
+        feature_count = len(row_payload)
 
-            has_predict_proba = hasattr(model, "predict_proba")
-            if has_predict_proba:
-                probs = model.predict_proba(X)[0]
-                classes = getattr(model, "classes_", None)
-                if classes is None:
-                    # For Pipeline, classes live on the classifier step
-                    clf = getattr(model, "named_steps", {}).get("clf")
-                    classes = getattr(clf, "classes_", None)
-                if classes is not None:
-                    result["probabilities"] = {str(c): float(p) for c, p in zip(classes, probs)}
+        with start_model_inference_span("typing-ml.model.predict", row_count=1, feature_count=feature_count) as span:
+            result = inference_service.predict_one(row_payload)
+            has_predict_proba = "probabilities" in result
+            pred = result.get("prediction")
 
             if span is not None and span.is_recording():
                 span.set_attribute("typing.ml.model.class", model.__class__.__name__)
@@ -329,29 +371,19 @@ def create_app() -> FastAPI:
         description="Send multiple rows and get predictions (and optional probabilities).",
     )
     def predict_batch(req: PredictBatchRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        if not req.rows:
-            raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
+        """Predict weakest finger labels for multiple input rows."""
 
-        X = build_frame([row.model_dump() for row in req.rows])
+        rows_payload = [row.model_dump() for row in req.rows]
+        feature_count = len(rows_payload[0]) if rows_payload else 0
 
         with start_model_inference_span(
             "typing-ml.model.predict_batch",
-            row_count=len(req.rows),
-            feature_count=len(X.columns),
+            row_count=len(rows_payload),
+            feature_count=feature_count,
         ) as span:
-            preds = model.predict(X)
-
-            out: Dict[str, Any] = {"predictions": [p for p in preds]}
-
-            has_predict_proba = hasattr(model, "predict_proba")
-            if has_predict_proba:
-                probas = model.predict_proba(X)
-                clf = getattr(model, "named_steps", {}).get("clf", model)
-                classes = getattr(clf, "classes_", None)
-                if classes is not None:
-                    out["probabilities"] = [
-                        {str(c): float(p) for c, p in zip(classes, row)} for row in probas
-                    ]
+            out = inference_service.predict_many(rows_payload)
+            preds = out.get("predictions", [])
+            has_predict_proba = "probabilities" in out
 
             if span is not None and span.is_recording():
                 span.set_attribute("typing.ml.model.class", model.__class__.__name__)

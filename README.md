@@ -60,6 +60,11 @@ Suggested folders:
 - `data/processed/` — cleaned data (ignored by git)
 - `models/` — saved models (ignored by git)
 
+Core package (OOP + SOLID):
+- `src/ml_pipeline/` — services, validators, factories, and interface contracts
+- `src/ml_pipeline/interfaces.py` — dependency inversion contracts used by services
+- `docs/oop-solid-architecture.md` — architecture and extension guide
+
 ---
 
 ## Setup (Conda)
@@ -95,7 +100,7 @@ bash scripts/beginner_flow.sh --skip-install --users 20 --sessions 5
 What this script does:
 1. Installs dependencies with your Conda environment
 2. Generates synthetic dataset
-3. Trains model (default: `--model-type auto`)
+3. Trains model (default: `--algorithm logistic_regression`)
 4. Evaluates and saves confusion matrix
 
 Main outputs you should expect:
@@ -113,7 +118,7 @@ bash scripts/beginner_flow.sh --help
 `scripts/beginner_flow.sh` validates CLI inputs before running:
 - `--users` and `--sessions` must be positive integers.
 - `--seed` must be an integer.
-- `--model-type` must be `auto`, `logistic_regression`, or `random_forest`.
+- `--algorithm` must be `logistic_regression`, `random_forest`, or `xgboost`.
 - Path arguments must be non-empty.
 
 At the end of the flow, it also verifies expected artifacts exist:
@@ -234,8 +239,8 @@ This reflects the thesis-valid feature set (including dwell time and flight time
 
 ### 5. Modeling Strategy
 
-- Candidate models: Logistic Regression and Random Forest.
-- `--model-type auto` trains candidates and selects the best by holdout accuracy.
+- Supported training algorithms: Logistic Regression, Random Forest, and XGBoost.
+- Select explicitly with `--algorithm` for reproducible experiments.
 
 ### 6. Evaluation
 
@@ -282,21 +287,23 @@ This means the standard model already includes dwell time and flight time as fir
 
 ### 4. Models Used in This Project
 
-Training in this repository evaluates two model families:
+Training in this repository supports three model families:
 
 1. Logistic Regression
 2. Random Forest
+3. XGBoost
 
 Selection behavior:
 
-- `--model-type auto` trains both candidates and selects the one with the best holdout accuracy.
-- `--model-type logistic_regression` forces Logistic Regression.
-- `--model-type random_forest` forces Random Forest.
+- `--algorithm logistic_regression` selects Logistic Regression.
+- `--algorithm random_forest` selects Random Forest.
+- `--algorithm xgboost` selects XGBoost.
 
 Why these models:
 
 - Logistic Regression provides a strong linear baseline that is easy to interpret.
 - Random Forest captures non-linear interactions between per-finger error/dwell/flight patterns.
+- XGBoost adds gradient-boosted trees for stronger nonlinear decision boundaries.
 
 ### 5. Experimental Protocol
 
@@ -365,7 +372,7 @@ For the latest filled example generated from an actual run, see `reports/results
 | Number of rows | `<fill>` |
 | Random seed | `42` |
 | Train-test split | `80:20 (stratified)` |
-| Candidate models | `logistic_regression`, `random_forest` |
+| Candidate models | `logistic_regression`, `random_forest`, `xgboost` |
 | Selected model | `<fill from training_report.json>` |
 
 #### B. Performance Summary Table
@@ -435,8 +442,8 @@ Penelitian ini menggunakan pendekatan **kuantitatif eksperimental** dengan tugas
 - Penggunaan random seed tetap untuk reprodusibilitas.
 
 5. Strategi pemodelan:
-- Model kandidat: Logistic Regression dan Random Forest.
-- Opsi `--model-type auto` memilih model terbaik berdasarkan akurasi holdout.
+- Model kandidat: Logistic Regression, Random Forest, dan XGBoost.
+- Pilih model secara eksplisit dengan `--algorithm`.
 
 6. Evaluasi:
 - Accuracy.
@@ -589,9 +596,9 @@ python src/train.py --data data/processed/dataset.csv
 Choose model strategy:
 
 ```bash
-python src/train.py --data data/processed/dataset.csv --model-type auto
-# or: --model-type logistic_regression
-# or: --model-type random_forest
+python src/train.py --data data/processed/dataset.csv --algorithm logistic_regression
+# or: --algorithm random_forest
+# or: --algorithm xgboost
 ```
 
 ---

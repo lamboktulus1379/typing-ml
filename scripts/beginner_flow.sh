@@ -14,7 +14,7 @@ CONDA_ENV_NAME="typing-ml"
 N_USERS_VALUE=500
 SESSIONS_PER_USER_VALUE=20
 SEED_VALUE=42
-MODEL_TYPE_VALUE="auto"
+ALGORITHM_VALUE="logistic_regression"
 DATA_PATH_VALUE="data/processed/dataset.csv"
 MODEL_PATH_VALUE="models/model.joblib"
 REPORT_PATH_VALUE="reports/training_report.json"
@@ -30,7 +30,9 @@ Options:
   --users <n>                   Number of users for synthetic data (default: 500)
   --sessions <n>                Sessions per user (default: 20)
   --seed <n>                    Random seed (default: 42)
-  --model-type <name>           auto | logistic_regression | random_forest (default: auto)
+  --algorithm <name>            logistic_regression | random_forest | xgboost
+                                 (default: logistic_regression)
+  --model-type <name>           Deprecated alias for --algorithm
   --data-path <path>            Dataset output/input path
   --model-path <path>           Trained model artifact path
   --report-path <path>          Training report output path
@@ -40,7 +42,7 @@ Options:
 
 Examples:
   bash scripts/beginner_flow.sh
-  bash scripts/beginner_flow.sh --users 200 --sessions 10 --model-type random_forest
+  bash scripts/beginner_flow.sh --users 200 --sessions 10 --algorithm random_forest
 EOF
 }
 
@@ -68,11 +70,11 @@ validate_inputs() {
     exit 1
   fi
 
-  case "$MODEL_TYPE_VALUE" in
-    auto|logistic_regression|random_forest) ;;
+  case "$ALGORITHM_VALUE" in
+    logistic_regression|random_forest|xgboost) ;;
     *)
-      echo "Error: --model-type must be one of: auto, logistic_regression, random_forest"
-      echo "       Received: $MODEL_TYPE_VALUE"
+      echo "Error: --algorithm must be one of: logistic_regression, random_forest, xgboost"
+      echo "       Received: $ALGORITHM_VALUE"
       exit 1
       ;;
   esac
@@ -110,7 +112,11 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model-type)
-      MODEL_TYPE_VALUE="$2"
+      ALGORITHM_VALUE="$2"
+      shift 2
+      ;;
+    --algorithm)
+      ALGORITHM_VALUE="$2"
       shift 2
       ;;
     --data-path)
@@ -166,7 +172,7 @@ fi
 echo "=== Typing-ML Beginner Flow ==="
 echo "Project root: $ROOT_DIR"
 echo "Conda env:    $CONDA_ENV_NAME"
-echo "Model type:   $MODEL_TYPE_VALUE"
+echo "Algorithm:    $ALGORITHM_VALUE"
 echo "Data path:    $DATA_PATH_VALUE"
 echo "Model path:   $MODEL_PATH_VALUE"
 echo "Report path:  $REPORT_PATH_VALUE"
@@ -195,7 +201,7 @@ make \
   MODEL_PATH="$MODEL_PATH_VALUE" \
   REPORT_PATH="$REPORT_PATH_VALUE" \
   SEED="$SEED_VALUE" \
-  MODEL_TYPE="$MODEL_TYPE_VALUE" \
+  ALGORITHM="$ALGORITHM_VALUE" \
   train
 
 echo "[4/4] Evaluating model..."
