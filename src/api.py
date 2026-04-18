@@ -18,29 +18,157 @@ Then open:
 import os
 import logging
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from threading import Lock, RLock
+from typing import Any, Dict, List, Optional, Sequence, cast
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
+import sklearn.metrics as sk_metrics
+import sklearn.model_selection as sk_model_selection
+from sklearn.preprocessing import LabelEncoder
 
 try:
-    from src.ml_pipeline.artifacts import ArtifactStore
+    from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
+    from src.ml_pipeline.constants import (
+        ALLOWED_WEAKEST_FINGER_LABELS,
+        FEATURE_RANGE_RULES,
+        TARGET_COLUMN,
+        TRAIN_FEATURE_COLUMNS,
+    )
+    from src.ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
+    from src.ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
 except ModuleNotFoundError:
-    from ml_pipeline.artifacts import ArtifactStore
+    from ml_pipeline.artifacts import ArtifactStore, ModelArtifact
+    from ml_pipeline.constants import (
+        ALLOWED_WEAKEST_FINGER_LABELS,
+        FEATURE_RANGE_RULES,
+        TARGET_COLUMN,
+        TRAIN_FEATURE_COLUMNS,
+    )
+    from ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
+    from ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
 
 
 MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "4096"))
 logger = logging.getLogger("typing-ml")
 
 DEFAULT_MODEL_PATH = "models/model.joblib"
+DEFAULT_PRODUCTION_MODEL_PATH = "models/model_production.joblib"
+DEFAULT_RETRAIN_RANDOM_STATE = int(os.getenv("TYPING_ML_RETRAIN_RANDOM_STATE", "42"))
+DEFAULT_RETRAIN_ALGORITHMS: tuple[str, ...] = (
+    Algorithm.LOGISTIC_REGRESSION.value,
+    Algorithm.RANDOM_FOREST.value,
+    Algorithm.XGBOOST.value,
+)
 DEFAULT_MODEL_PATH_BY_ALGORITHM = {
     "logistic_regression": "models/model_compare_logistic_regression.joblib",
     "random_forest": "models/model_compare_random_forest.joblib",
     "xgboost": "models/model_compare_xgboost.joblib",
 }
+
+
+@dataclass(frozen=True)
+class RuntimeInferenceState:
+    """Thread-safe snapshot holder for active inference model and service."""
+
+    inference_service: "InferenceService"
+    model: Any
+
+
+@dataclass(frozen=True)
+class CandidateTrainingResult:
+    """Captured quality metrics and fitted model for one algorithm candidate."""
+
+    algorithm: str
+    accuracy: float
+    f1_score: float
+    model: Any
+
+
+def resolve_retrain_algorithms_from_env() -> tuple[str, ...]:
+    """Resolve retraining candidate algorithms from environment configuration."""
+
+    raw_algorithms = os.getenv("TYPING_ML_RETRAIN_ALGORITHMS")
+    if not raw_algorithms:
+        return DEFAULT_RETRAIN_ALGORITHMS
+
+    requested = tuple(
+        value.strip().lower()
+        for value in raw_algorithms.split(",")
+        if value.strip()
+    )
+    if not requested:
+        raise RuntimeError(
+            "TYPING_ML_RETRAIN_ALGORITHMS is set but contains no valid algorithm values."
+        )
+
+    allowed = set(Algorithm.choices())
+    invalid = sorted(set(requested) - allowed)
+    if invalid:
+        raise RuntimeError(
+            "Unsupported TYPING_ML_RETRAIN_ALGORITHMS values: "
+            f"{invalid}. Supported values: {sorted(allowed)}"
+        )
+
+    return requested
+
+
+def train_candidate_model(
+    algorithm: str,
+    *,
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    target_series: pd.Series,
+    random_state: int,
+) -> CandidateTrainingResult:
+    """Fit one candidate algorithm and return weighted F1 + accuracy metrics."""
+
+    model_factory = ModelPipelineFactory(random_state=random_state)
+    model = model_factory.create(algorithm)
+
+    label_encoder: LabelEncoder | None = None
+    y_train_for_fit: Any = y_train
+    if algorithm == Algorithm.XGBOOST.value:
+        label_encoder = LabelEncoder()
+        label_encoder.fit(target_series)
+        y_train_for_fit = label_encoder.transform(y_train)
+
+    model.fit(x_train, y_train_for_fit)
+    predictions = model.predict(x_test)
+
+    if label_encoder is not None:
+        encoded_predictions = pd.Series(predictions).astype(int).to_numpy()
+        predictions = label_encoder.inverse_transform(encoded_predictions)
+
+    accuracy = float(sk_metrics.accuracy_score(y_test, predictions))
+    f1_score = float(sk_metrics.f1_score(y_test, predictions, average="weighted"))
+
+    return CandidateTrainingResult(
+        algorithm=algorithm,
+        accuracy=accuracy,
+        f1_score=f1_score,
+        model=model,
+    )
+
+
+def choose_winner(candidates: Sequence[CandidateTrainingResult]) -> CandidateTrainingResult:
+    """Choose a winner by F1, then accuracy, then lexical algorithm name."""
+
+    if not candidates:
+        raise ValueError("No candidate models were produced during retraining.")
+
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (-candidate.f1_score, -candidate.accuracy, candidate.algorithm),
+    )
+    return ranked[0]
 
 
 def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
@@ -309,6 +437,12 @@ class PredictBatchRequest(BaseModel):
     rows: List[TypingSessionData]
 
 
+class TypingSessionTrainingData(TypingSessionData):
+    """Retraining row payload schema including supervised target label."""
+
+    weakest_finger: str
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -387,6 +521,26 @@ def create_app() -> FastAPI:
                 span.set_attribute("typing.ml.model.algorithm", selected_algorithm)
 
     inference_service = InferenceService(model, artifact, model_path, selected_algorithm)
+    retrain_algorithms = resolve_retrain_algorithms_from_env()
+    production_model_path = os.getenv(
+        "TYPING_ML_PRODUCTION_MODEL_PATH",
+        DEFAULT_PRODUCTION_MODEL_PATH,
+    )
+
+    runtime_lock = RLock()
+    training_lock = Lock()
+    runtime_state = RuntimeInferenceState(inference_service=inference_service, model=model)
+    feature_validator = FeatureFrameValidator(FEATURE_RANGE_RULES)
+    target_validator = TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS)
+
+    def get_runtime_snapshot() -> RuntimeInferenceState:
+        with runtime_lock:
+            return runtime_state
+
+    def replace_runtime_state(new_state: RuntimeInferenceState) -> None:
+        nonlocal runtime_state
+        with runtime_lock:
+            runtime_state = new_state
 
     @app.get(
         "/health",
@@ -406,17 +560,178 @@ def create_app() -> FastAPI:
     def metadata() -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Expose model schema and class metadata for API clients."""
 
+        runtime_snapshot = get_runtime_snapshot()
+        current_service = runtime_snapshot.inference_service
+        current_model = runtime_snapshot.model
+
         with start_model_internal_span("typing-ml.model.metadata") as span:
-            metadata_payload = inference_service.get_metadata()
+            metadata_payload = current_service.get_metadata()
             classes_list = metadata_payload.get("classes")
             feature_names = metadata_payload.get("feature_names")
 
             if span is not None and span.is_recording():
-                span.set_attribute("typing.ml.model.class", model.__class__.__name__)
+                span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.feature_count", len(feature_names) if feature_names else 0)
                 span.set_attribute("typing.ml.model.class_count", len(classes_list) if classes_list else 0)
 
             return metadata_payload
+
+    @app.post(
+        "/train",
+        summary="Retrain and hot-reload production model",
+        description=(
+            "Train logistic_regression, random_forest, and xgboost on in-memory payload rows, "
+            "select the winner by weighted F1-score, persist the winner artifact, then hot-reload "
+            "the active inference model without process restart."
+        ),
+    )
+    def train(rows: List[TypingSessionTrainingData]) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Run one retraining cycle and atomically replace runtime inference model on success."""
+
+        if not rows:
+            raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
+
+        if not training_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "Retraining is already in progress"},
+            )
+
+        try:
+            normalized_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                row_payload = row.model_dump()
+                row_payload[TARGET_COLUMN] = str(row_payload[TARGET_COLUMN]).strip().lower()
+
+                # Accept legacy percentage-style accuracy and normalize to ratio.
+                accuracy_value = float(row_payload["accuracy"])
+                if 1.0 < accuracy_value <= 100.0:
+                    row_payload["accuracy"] = accuracy_value / 100.0
+
+                normalized_rows.append(row_payload)
+
+            dataframe = pd.DataFrame(normalized_rows)
+            try:
+                feature_frame = feature_validator.validate(
+                    dataframe,
+                    required_columns=TRAIN_FEATURE_COLUMNS,
+                    context="Retraining payload",
+                )
+                target_series = target_validator.validate(
+                    dataframe[TARGET_COLUMN],
+                    target_name=TARGET_COLUMN,
+                    context="Retraining payload",
+                )
+            except ValueError as ex:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Invalid retraining payload",
+                        "detail": str(ex),
+                    },
+                ) from ex
+
+            try:
+                split_result = sk_model_selection.train_test_split(
+                    feature_frame,
+                    target_series,
+                    test_size=0.2,
+                    random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                    stratify=target_series,
+                )
+                x_train, x_test, y_train, y_test = cast(
+                    tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series],
+                    tuple(split_result),
+                )
+            except ValueError as ex:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Unable to create train/test split",
+                        "detail": str(ex),
+                    },
+                ) from ex
+
+            candidate_results: List[CandidateTrainingResult] = []
+            candidate_failures: Dict[str, str] = {}
+
+            with ThreadPoolExecutor(max_workers=len(retrain_algorithms)) as executor:
+                future_by_algorithm = {
+                    executor.submit(
+                        train_candidate_model,
+                        algorithm,
+                        x_train=x_train,
+                        x_test=x_test,
+                        y_train=y_train,
+                        y_test=y_test,
+                        target_series=target_series,
+                        random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                    ): algorithm
+                    for algorithm in retrain_algorithms
+                }
+
+                for future in as_completed(future_by_algorithm):
+                    algorithm = future_by_algorithm[future]
+                    try:
+                        candidate_results.append(future.result())
+                    except Exception as ex:  # pragma: no cover - defensive runtime guard
+                        candidate_failures[algorithm] = str(ex)
+
+            if candidate_failures:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "One or more candidate trainings failed",
+                        "failures": candidate_failures,
+                    },
+                )
+
+            winner = choose_winner(candidate_results)
+            winner_artifact = ModelArtifact.from_training(
+                model=winner.model,
+                model_name=winner.algorithm,
+                feature_names=TRAIN_FEATURE_COLUMNS,
+                target_name=TARGET_COLUMN,
+            )
+            artifact_store.save_model_artifact(winner_artifact, production_model_path)
+
+            new_service = InferenceService(
+                winner.model,
+                winner_artifact.to_dict(),
+                production_model_path,
+                winner.algorithm,
+            )
+            replace_runtime_state(
+                RuntimeInferenceState(inference_service=new_service, model=winner.model)
+            )
+
+            candidates_payload = {
+                result.algorithm: {
+                    "accuracy": result.accuracy,
+                    "f1_score": result.f1_score,
+                }
+                for result in sorted(candidate_results, key=lambda item: item.algorithm)
+            }
+
+            logger.info(
+                "typing-ml retrain completed rows=%s winner=%s accuracy=%.4f f1=%.4f path=%s",
+                len(rows),
+                winner.algorithm,
+                winner.accuracy,
+                winner.f1_score,
+                production_model_path,
+            )
+
+            return {
+                "algorithm": winner.algorithm,
+                "accuracy": winner.accuracy,
+                "f1_score": winner.f1_score,
+                "rows_processed": len(rows),
+                "model_path": production_model_path,
+                "candidates": candidates_payload,
+            }
+        finally:
+            training_lock.release()
 
     @app.post(
         "/predict",
@@ -429,16 +744,19 @@ def create_app() -> FastAPI:
     def predict(req: PredictRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Predict weakest finger for a single input row."""
 
+        runtime_snapshot = get_runtime_snapshot()
+        current_service = runtime_snapshot.inference_service
+        current_model = runtime_snapshot.model
         row_payload = req.row.model_dump()
         feature_count = len(row_payload)
 
         with start_model_inference_span("typing-ml.model.predict", row_count=1, feature_count=feature_count) as span:
-            result = inference_service.predict_one(row_payload)
+            result = current_service.predict_one(row_payload)
             has_predict_proba = "probabilities" in result
             pred = result.get("prediction")
 
             if span is not None and span.is_recording():
-                span.set_attribute("typing.ml.model.class", model.__class__.__name__)
+                span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.has_predict_proba", has_predict_proba)
                 span.set_attribute("typing.ml.model.prediction", str(pred))
 
@@ -452,6 +770,9 @@ def create_app() -> FastAPI:
     def predict_batch(req: PredictBatchRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Predict weakest finger labels for multiple input rows."""
 
+        runtime_snapshot = get_runtime_snapshot()
+        current_service = runtime_snapshot.inference_service
+        current_model = runtime_snapshot.model
         rows_payload = [row.model_dump() for row in req.rows]
         feature_count = len(rows_payload[0]) if rows_payload else 0
 
@@ -460,12 +781,12 @@ def create_app() -> FastAPI:
             row_count=len(rows_payload),
             feature_count=feature_count,
         ) as span:
-            out = inference_service.predict_many(rows_payload)
+            out = current_service.predict_many(rows_payload)
             preds = out.get("predictions", [])
             has_predict_proba = "probabilities" in out
 
             if span is not None and span.is_recording():
-                span.set_attribute("typing.ml.model.class", model.__class__.__name__)
+                span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.has_predict_proba", has_predict_proba)
                 span.set_attribute("typing.ml.model.prediction_count", len(preds))
 
