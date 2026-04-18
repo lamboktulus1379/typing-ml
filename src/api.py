@@ -18,7 +18,7 @@ Then open:
 import os
 import logging
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock, RLock
@@ -28,9 +28,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-import sklearn.metrics as sk_metrics
-import sklearn.model_selection as sk_model_selection
-from sklearn.preprocessing import LabelEncoder
 
 try:
     from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
@@ -42,6 +39,7 @@ try:
     )
     from src.ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from src.ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
+    from src.services.training_service import TrainingArenaService
 except ModuleNotFoundError:
     from ml_pipeline.artifacts import ArtifactStore, ModelArtifact
     from ml_pipeline.constants import (
@@ -52,6 +50,7 @@ except ModuleNotFoundError:
     )
     from ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
+    from services.training_service import TrainingArenaService
 
 
 MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "4096"))
@@ -59,6 +58,7 @@ logger = logging.getLogger("typing-ml")
 
 DEFAULT_MODEL_PATH = "models/model.joblib"
 DEFAULT_PRODUCTION_MODEL_PATH = "models/model_production.joblib"
+DEFAULT_TRAIN_REPORTS_DIR = "reports/retrain_runs"
 DEFAULT_RETRAIN_RANDOM_STATE = int(os.getenv("TYPING_ML_RETRAIN_RANDOM_STATE", "42"))
 DEFAULT_RETRAIN_ALGORITHMS: tuple[str, ...] = (
     Algorithm.LOGISTIC_REGRESSION.value,
@@ -77,16 +77,6 @@ class RuntimeInferenceState:
     """Thread-safe snapshot holder for active inference model and service."""
 
     inference_service: "InferenceService"
-    model: Any
-
-
-@dataclass(frozen=True)
-class CandidateTrainingResult:
-    """Captured quality metrics and fitted model for one algorithm candidate."""
-
-    algorithm: str
-    accuracy: float
-    f1_score: float
     model: Any
 
 
@@ -116,59 +106,6 @@ def resolve_retrain_algorithms_from_env() -> tuple[str, ...]:
         )
 
     return requested
-
-
-def train_candidate_model(
-    algorithm: str,
-    *,
-    x_train: pd.DataFrame,
-    x_test: pd.DataFrame,
-    y_train: pd.Series,
-    y_test: pd.Series,
-    target_series: pd.Series,
-    random_state: int,
-) -> CandidateTrainingResult:
-    """Fit one candidate algorithm and return weighted F1 + accuracy metrics."""
-
-    model_factory = ModelPipelineFactory(random_state=random_state)
-    model = model_factory.create(algorithm)
-
-    label_encoder: LabelEncoder | None = None
-    y_train_for_fit: Any = y_train
-    if algorithm == Algorithm.XGBOOST.value:
-        label_encoder = LabelEncoder()
-        label_encoder.fit(target_series)
-        y_train_for_fit = label_encoder.transform(y_train)
-
-    model.fit(x_train, y_train_for_fit)
-    predictions = model.predict(x_test)
-
-    if label_encoder is not None:
-        encoded_predictions = pd.Series(predictions).astype(int).to_numpy()
-        predictions = label_encoder.inverse_transform(encoded_predictions)
-
-    accuracy = float(sk_metrics.accuracy_score(y_test, predictions))
-    f1_score = float(sk_metrics.f1_score(y_test, predictions, average="weighted"))
-
-    return CandidateTrainingResult(
-        algorithm=algorithm,
-        accuracy=accuracy,
-        f1_score=f1_score,
-        model=model,
-    )
-
-
-def choose_winner(candidates: Sequence[CandidateTrainingResult]) -> CandidateTrainingResult:
-    """Choose a winner by F1, then accuracy, then lexical algorithm name."""
-
-    if not candidates:
-        raise ValueError("No candidate models were produced during retraining.")
-
-    ranked = sorted(
-        candidates,
-        key=lambda candidate: (-candidate.f1_score, -candidate.accuracy, candidate.algorithm),
-    )
-    return ranked[0]
 
 
 def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
@@ -456,6 +393,81 @@ class RetrainRequest(BaseModel):
     )
 
 
+class TrainMetricsResponse(BaseModel):
+    """Winner metrics preserved for backwards-compatible clients."""
+
+    f1_score: float
+    accuracy: float
+
+
+class TrainLeaderboardEntryResponse(BaseModel):
+    """Public leaderboard entry for one evaluated algorithm."""
+
+    name: str
+    accuracy: float
+    f1_score: float
+    execution_time_ms: float
+
+
+class TrainResponse(BaseModel):
+    """Typed retraining response for the Algorithm Arena flow."""
+
+    status: str
+    winning_algorithm: str
+    winning_f1_score: float
+    total_rows_processed: int
+    leaderboard: List[TrainLeaderboardEntryResponse]
+    algorithm: str
+    accuracy: float
+    f1_score: float
+    rows_processed: int
+    trained_rows: int
+    metrics: TrainMetricsResponse
+    candidates: Dict[str, TrainLeaderboardEntryResponse]
+    model_path: Optional[str] = None
+    report_path: Optional[str] = None
+
+
+def build_train_report_path(status: str) -> str:
+    """Create a timestamped JSON report path for one retraining run."""
+
+    reports_dir = os.getenv("TYPING_ML_TRAIN_REPORTS_DIR", DEFAULT_TRAIN_REPORTS_DIR)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    return os.path.join(reports_dir, f"train_{status}_{timestamp}.json")
+
+
+def persist_train_report(
+    artifact_store: ArtifactStore,
+    response: TrainResponse,
+    *,
+    is_dry_run: bool,
+    random_state: int,
+) -> str:
+    """Persist a JSON report artifact for thesis audit and reproducibility."""
+
+    report_path = build_train_report_path(response.status)
+    report_payload = {
+        "status": response.status,
+        "is_dry_run": is_dry_run,
+        "random_state": random_state,
+        "target_column": TARGET_COLUMN,
+        "winning_algorithm": response.winning_algorithm,
+        "winning_f1_score": response.winning_f1_score,
+        "total_rows_processed": response.total_rows_processed,
+        "leaderboard": [entry.model_dump() for entry in response.leaderboard],
+        "metrics": response.metrics.model_dump(),
+        "algorithm": response.algorithm,
+        "accuracy": response.accuracy,
+        "f1_score": response.f1_score,
+        "rows_processed": response.rows_processed,
+        "trained_rows": response.trained_rows,
+        "model_path": response.model_path,
+        "report_created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    artifact_store.save_report(report_payload, report_path)
+    return report_path
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -545,6 +557,12 @@ def create_app() -> FastAPI:
     runtime_state = RuntimeInferenceState(inference_service=inference_service, model=model)
     feature_validator = FeatureFrameValidator(FEATURE_RANGE_RULES)
     target_validator = TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS)
+    training_service = TrainingArenaService(
+        model_factory=ModelPipelineFactory(random_state=DEFAULT_RETRAIN_RANDOM_STATE),
+        feature_validator=feature_validator,
+        target_validator=target_validator,
+        random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+    )
 
     def get_runtime_snapshot() -> RuntimeInferenceState:
         with runtime_lock:
@@ -594,13 +612,14 @@ def create_app() -> FastAPI:
         summary="Retrain model (supports dry run and production mode)",
         description=(
             "Train logistic_regression, random_forest, and xgboost on in-memory payload rows, "
-            "select the winner by weighted F1-score, and optionally persist the winner artifact "
-            "(production mode) or skip persistence (dry-run mode)."
+            "select the winner by macro F1-score on a deterministic 80/20 split, retrain the winner "
+            "on 100% of the dataset, and optionally persist the production artifact."
         ),
+        response_model=TrainResponse,
     )
     def train(
         payload: RetrainRequest | List[TypingSessionTrainingData],
-    ) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    ) -> TrainResponse:  # pyright: ignore[reportUnusedFunction]
         """Run one retraining cycle and optionally replace runtime inference model."""
 
         if isinstance(payload, list):
@@ -633,19 +652,11 @@ def create_app() -> FastAPI:
                 normalized_rows.append(row_payload)
 
             dataframe = pd.DataFrame(normalized_rows)
-            # Remove duplicate rows to keep training math deterministic across reruns.
-            dataframe = dataframe.drop_duplicates().reset_index(drop=True)
 
             try:
-                feature_frame = feature_validator.validate(
+                arena_result = training_service.run_algorithm_arena(
                     dataframe,
-                    required_columns=TRAIN_FEATURE_COLUMNS,
-                    context="Retraining payload",
-                )
-                target_series = target_validator.validate(
-                    dataframe[TARGET_COLUMN],
-                    target_name=TARGET_COLUMN,
-                    context="Retraining payload",
+                    algorithms=retrain_algorithms,
                 )
             except ValueError as ex:
                 raise HTTPException(
@@ -655,128 +666,111 @@ def create_app() -> FastAPI:
                         "detail": str(ex),
                     },
                 ) from ex
-
-            try:
-                split_result = sk_model_selection.train_test_split(
-                    feature_frame,
-                    target_series,
-                    test_size=0.2,
-                    random_state=DEFAULT_RETRAIN_RANDOM_STATE,
-                    stratify=target_series,
-                )
-                x_train, x_test, y_train, y_test = cast(
-                    tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series],
-                    tuple(split_result),
-                )
-            except ValueError as ex:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "Unable to create train/test split",
-                        "detail": str(ex),
-                    },
-                ) from ex
-
-            candidate_results: List[CandidateTrainingResult] = []
-            candidate_failures: Dict[str, str] = {}
-
-            with ThreadPoolExecutor(max_workers=len(retrain_algorithms)) as executor:
-                future_by_algorithm = {
-                    executor.submit(
-                        train_candidate_model,
-                        algorithm,
-                        x_train=x_train,
-                        x_test=x_test,
-                        y_train=y_train,
-                        y_test=y_test,
-                        target_series=target_series,
-                        random_state=DEFAULT_RETRAIN_RANDOM_STATE,
-                    ): algorithm
-                    for algorithm in retrain_algorithms
-                }
-
-                for future in as_completed(future_by_algorithm):
-                    algorithm = future_by_algorithm[future]
-                    try:
-                        candidate_results.append(future.result())
-                    except Exception as ex:  # pragma: no cover - defensive runtime guard
-                        candidate_failures[algorithm] = str(ex)
-
-            if candidate_failures:
+            except RuntimeError as ex:
                 raise HTTPException(
                     status_code=500,
                     detail={
-                        "error": "One or more candidate trainings failed",
-                        "failures": candidate_failures,
+                        "error": "Retraining failed",
+                        "detail": str(ex),
                     },
                 )
 
-            winner = choose_winner(candidate_results)
-
-            candidates_payload = {
-                result.algorithm: {
-                    "accuracy": result.accuracy,
-                    "f1_score": result.f1_score,
-                }
-                for result in sorted(candidate_results, key=lambda item: item.algorithm)
-            }
-
-            rows_processed = int(len(dataframe))
+            leaderboard = [
+                TrainLeaderboardEntryResponse(
+                    name=entry.name,
+                    accuracy=entry.accuracy,
+                    f1_score=entry.f1_score,
+                    execution_time_ms=entry.execution_time_ms,
+                )
+                for entry in arena_result.leaderboard
+            ]
+            candidates_payload = {entry.name: entry for entry in leaderboard}
+            metrics = TrainMetricsResponse(
+                f1_score=arena_result.winning_f1_score,
+                accuracy=arena_result.winning_accuracy,
+            )
 
             if is_dry_run:
                 logger.info(
-                    "typing-ml retrain dry-run completed rows=%s winner=%s accuracy=%.4f f1=%.4f",
-                    rows_processed,
-                    winner.algorithm,
-                    winner.accuracy,
-                    winner.f1_score,
+                    "typing-ml retrain dry-run completed rows=%s winner=%s accuracy=%.4f macro_f1=%.4f",
+                    arena_result.total_rows_processed,
+                    arena_result.winning_algorithm,
+                    arena_result.winning_accuracy,
+                    arena_result.winning_f1_score,
                 )
 
-                return {
-                    "status": "success_dry_run",
-                    "algorithm": winner.algorithm,
-                    "accuracy": winner.accuracy,
-                    "f1_score": winner.f1_score,
-                    "rows_processed": rows_processed,
-                    "candidates": candidates_payload,
-                }
+                response = TrainResponse(
+                    status="success_dry_run",
+                    winning_algorithm=arena_result.winning_algorithm,
+                    winning_f1_score=arena_result.winning_f1_score,
+                    total_rows_processed=arena_result.total_rows_processed,
+                    leaderboard=leaderboard,
+                    algorithm=arena_result.winning_algorithm,
+                    accuracy=arena_result.winning_accuracy,
+                    f1_score=arena_result.winning_f1_score,
+                    rows_processed=arena_result.total_rows_processed,
+                    trained_rows=arena_result.total_rows_processed,
+                    metrics=metrics,
+                    candidates=candidates_payload,
+                )
+                report_path = persist_train_report(
+                    artifact_store,
+                    response,
+                    is_dry_run=True,
+                    random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                )
+                return response.model_copy(update={"report_path": report_path})
 
             winner_artifact = ModelArtifact.from_training(
-                model=winner.model,
-                model_name=winner.algorithm,
+                model=arena_result.retrained_model,
+                model_name=arena_result.winning_algorithm,
                 feature_names=TRAIN_FEATURE_COLUMNS,
                 target_name=TARGET_COLUMN,
+                label_classes=arena_result.retrained_label_classes,
             )
             artifact_store.save_model_artifact(winner_artifact, production_model_path)
 
             new_service = InferenceService(
-                winner.model,
+                arena_result.retrained_model,
                 winner_artifact.to_dict(),
                 production_model_path,
-                winner.algorithm,
+                arena_result.winning_algorithm,
             )
             replace_runtime_state(
-                RuntimeInferenceState(inference_service=new_service, model=winner.model)
+                RuntimeInferenceState(inference_service=new_service, model=arena_result.retrained_model)
             )
 
             logger.info(
-                "typing-ml retrain production completed rows=%s winner=%s accuracy=%.4f f1=%.4f path=%s",
-                rows_processed,
-                winner.algorithm,
-                winner.accuracy,
-                winner.f1_score,
+                "typing-ml retrain production completed rows=%s winner=%s accuracy=%.4f macro_f1=%.4f path=%s",
+                arena_result.total_rows_processed,
+                arena_result.winning_algorithm,
+                arena_result.winning_accuracy,
+                arena_result.winning_f1_score,
                 production_model_path,
             )
 
-            return {
-                "status": "success_production",
-                "algorithm": winner.algorithm,
-                "accuracy": winner.accuracy,
-                "f1_score": winner.f1_score,
-                "rows_processed": rows_processed,
-                "model_path": production_model_path,
-                "candidates": candidates_payload,
-            }
+            response = TrainResponse(
+                status="success_production",
+                winning_algorithm=arena_result.winning_algorithm,
+                winning_f1_score=arena_result.winning_f1_score,
+                total_rows_processed=arena_result.total_rows_processed,
+                leaderboard=leaderboard,
+                algorithm=arena_result.winning_algorithm,
+                accuracy=arena_result.winning_accuracy,
+                f1_score=arena_result.winning_f1_score,
+                rows_processed=arena_result.total_rows_processed,
+                trained_rows=arena_result.total_rows_processed,
+                metrics=metrics,
+                candidates=candidates_payload,
+                model_path=production_model_path,
+            )
+            report_path = persist_train_report(
+                artifact_store,
+                response,
+                is_dry_run=False,
+                random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+            )
+            return response.model_copy(update={"report_path": report_path})
         finally:
             training_lock.release()
 

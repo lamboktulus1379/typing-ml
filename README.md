@@ -46,6 +46,36 @@ Validation guardrails in `train.py` and `evaluate.py`:
 - Feature values must be finite (no `inf`/`-inf`) and within expected ranges.
 - Target labels must be one of the 8 finger classes.
 - Target must have at least 2 classes and at least 2 rows per class (for stratified split).
+
+## Algorithm Arena Retraining
+
+The FastAPI `/train` endpoint is the online MLOps entrypoint for the thesis workflow.
+
+It now follows an "Algorithm Arena" evaluation flow:
+
+1. Normalize and validate the incoming payload.
+2. Remove exact duplicate rows for deterministic reruns.
+3. Split the dataset into 80% train and 20% test with `random_state=42`.
+4. Train and evaluate three candidate algorithms on the same split:
+  - `logistic_regression`
+  - `random_forest`
+  - `xgboost`
+5. Score each candidate by:
+  - accuracy
+  - macro F1-score
+  - training execution time in milliseconds
+6. Select the winner by highest macro F1-score.
+7. Retrain the winning algorithm from scratch on 100% of the dataset.
+8. If `is_dry_run` is `false`, save the final production artifact and hot-reload the in-memory model.
+
+This gives you two layers of evidence for thesis reporting:
+
+- a fair scientific comparison on a fixed holdout split
+- a production-ready final model trained on the full available dataset
+
+The `/train` response includes a leaderboard for all three candidate algorithms plus winner metadata.
+
+Each `/train` call also persists a timestamped JSON report under `reports/retrain_runs/` by default. You can override the output directory with `TYPING_ML_TRAIN_REPORTS_DIR`.
 ---
 
 ## Repository Structure
