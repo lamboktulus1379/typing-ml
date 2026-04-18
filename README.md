@@ -53,6 +53,7 @@ Validation guardrails in `train.py` and `evaluate.py`:
 - `notebooks/01_eda.ipynb` — explore/clean data and export processed dataset
 - `src/train.py` — reproducible training pipeline
 - `src/evaluate.py` — evaluation + plots
+- `docs/api.md` — FastAPI contract details including `/train` dry-run vs production behavior
 - `reports/results.md` — experiment notes (thesis-friendly)
 - `docs/feature-tasks/mlops-retraining/01-ml-engine-requirements.md` — service-level retraining requirements for FastAPI worker
 

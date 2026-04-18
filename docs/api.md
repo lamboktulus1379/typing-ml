@@ -152,6 +152,86 @@ Request JSON shape:
 }
 ```
 
+### POST `/train`
+
+Purpose: run retraining pipeline with optional dry-run safety mode.
+
+Preferred request JSON shape:
+
+```json
+{
+  "is_dry_run": true,
+  "rows": [
+    {
+      "wpm": 55,
+      "accuracy": 0.93,
+      "error_left_pinky": 0.02,
+      "error_left_ring": 0.01,
+      "error_left_middle": 0.01,
+      "error_left_index": 0.01,
+      "error_right_index": 0.02,
+      "error_right_middle": 0.01,
+      "error_right_ring": 0.01,
+      "error_right_pinky": 0.01,
+      "dwell_left_pinky": 115,
+      "dwell_left_ring": 98,
+      "dwell_left_middle": 91,
+      "dwell_left_index": 86,
+      "dwell_right_index": 88,
+      "dwell_right_middle": 93,
+      "dwell_right_ring": 99,
+      "dwell_right_pinky": 121,
+      "flight_left_pinky": 220,
+      "flight_left_ring": 198,
+      "flight_left_middle": 180,
+      "flight_left_index": 171,
+      "flight_right_index": 174,
+      "flight_right_middle": 182,
+      "flight_right_ring": 203,
+      "flight_right_pinky": 231,
+      "weakest_finger": "right_pinky"
+    }
+  ]
+}
+```
+
+Behavior:
+- The API normalizes and validates rows, then creates a DataFrame.
+- Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
+- Candidate models are trained and evaluated; winner is selected by weighted F1, then accuracy.
+
+Dry-run mode (`is_dry_run=true`, default):
+- Trains and evaluates candidates.
+- Does NOT save artifact to disk.
+- Does NOT hot-reload runtime model state.
+- Returns status:
+
+```json
+{
+  "status": "success_dry_run",
+  "algorithm": "xgboost",
+  "accuracy": 0.94,
+  "f1_score": 0.91
+}
+```
+
+Production mode (`is_dry_run=false`):
+- Saves winner artifact to production model path.
+- Hot-reloads active model in API memory.
+- Returns status:
+
+```json
+{
+  "status": "success_production",
+  "algorithm": "xgboost",
+  "accuracy": 0.94,
+  "f1_score": 0.91
+}
+```
+
+Compatibility note:
+- Legacy payloads that post only an array of rows are still accepted and treated as dry-run.
+
 ## Integration impact for .NET backend / frontend
 
 If your .NET backend or frontend calls this API, update request contracts to match:
