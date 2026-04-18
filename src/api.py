@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, cast
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import sklearn.metrics as sk_metrics
 import sklearn.model_selection as sk_model_selection
 from sklearn.preprocessing import LabelEncoder
@@ -443,6 +443,19 @@ class TypingSessionTrainingData(TypingSessionData):
     weakest_finger: str
 
 
+class RetrainRequest(BaseModel):
+    """Retraining payload contract with dry-run safety mode."""
+
+    rows: List[TypingSessionTrainingData]
+    is_dry_run: bool = Field(
+        default=True,
+        description=(
+            "If true, trains the model and returns metrics but does NOT save "
+            "the model to disk."
+        ),
+    )
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -578,15 +591,24 @@ def create_app() -> FastAPI:
 
     @app.post(
         "/train",
-        summary="Retrain and hot-reload production model",
+        summary="Retrain model (supports dry run and production mode)",
         description=(
             "Train logistic_regression, random_forest, and xgboost on in-memory payload rows, "
-            "select the winner by weighted F1-score, persist the winner artifact, then hot-reload "
-            "the active inference model without process restart."
+            "select the winner by weighted F1-score, and optionally persist the winner artifact "
+            "(production mode) or skip persistence (dry-run mode)."
         ),
     )
-    def train(rows: List[TypingSessionTrainingData]) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Run one retraining cycle and atomically replace runtime inference model on success."""
+    def train(
+        payload: RetrainRequest | List[TypingSessionTrainingData],
+    ) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Run one retraining cycle and optionally replace runtime inference model."""
+
+        if isinstance(payload, list):
+            rows = payload
+            is_dry_run = True
+        else:
+            rows = payload.rows
+            is_dry_run = payload.is_dry_run
 
         if not rows:
             raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
@@ -611,6 +633,9 @@ def create_app() -> FastAPI:
                 normalized_rows.append(row_payload)
 
             dataframe = pd.DataFrame(normalized_rows)
+            # Remove duplicate rows to keep training math deterministic across reruns.
+            dataframe = dataframe.drop_duplicates().reset_index(drop=True)
+
             try:
                 feature_frame = feature_validator.validate(
                     dataframe,
@@ -687,6 +712,35 @@ def create_app() -> FastAPI:
                 )
 
             winner = choose_winner(candidate_results)
+
+            candidates_payload = {
+                result.algorithm: {
+                    "accuracy": result.accuracy,
+                    "f1_score": result.f1_score,
+                }
+                for result in sorted(candidate_results, key=lambda item: item.algorithm)
+            }
+
+            rows_processed = int(len(dataframe))
+
+            if is_dry_run:
+                logger.info(
+                    "typing-ml retrain dry-run completed rows=%s winner=%s accuracy=%.4f f1=%.4f",
+                    rows_processed,
+                    winner.algorithm,
+                    winner.accuracy,
+                    winner.f1_score,
+                )
+
+                return {
+                    "status": "success_dry_run",
+                    "algorithm": winner.algorithm,
+                    "accuracy": winner.accuracy,
+                    "f1_score": winner.f1_score,
+                    "rows_processed": rows_processed,
+                    "candidates": candidates_payload,
+                }
+
             winner_artifact = ModelArtifact.from_training(
                 model=winner.model,
                 model_name=winner.algorithm,
@@ -705,17 +759,9 @@ def create_app() -> FastAPI:
                 RuntimeInferenceState(inference_service=new_service, model=winner.model)
             )
 
-            candidates_payload = {
-                result.algorithm: {
-                    "accuracy": result.accuracy,
-                    "f1_score": result.f1_score,
-                }
-                for result in sorted(candidate_results, key=lambda item: item.algorithm)
-            }
-
             logger.info(
-                "typing-ml retrain completed rows=%s winner=%s accuracy=%.4f f1=%.4f path=%s",
-                len(rows),
+                "typing-ml retrain production completed rows=%s winner=%s accuracy=%.4f f1=%.4f path=%s",
+                rows_processed,
                 winner.algorithm,
                 winner.accuracy,
                 winner.f1_score,
@@ -723,10 +769,11 @@ def create_app() -> FastAPI:
             )
 
             return {
+                "status": "success_production",
                 "algorithm": winner.algorithm,
                 "accuracy": winner.accuracy,
                 "f1_score": winner.f1_score,
-                "rows_processed": len(rows),
+                "rows_processed": rows_processed,
                 "model_path": production_model_path,
                 "candidates": candidates_payload,
             }

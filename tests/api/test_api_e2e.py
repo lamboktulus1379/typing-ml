@@ -312,6 +312,30 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert "prediction" in predict_response.json()
 
 
+def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    unique_rows = _build_retraining_rows()
+    duplicated_rows = unique_rows + [dict(unique_rows[0]), dict(unique_rows[6])]
+
+    response = api_client.post(
+        "/train",
+        json={"is_dry_run": True, "rows": duplicated_rows},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success_dry_run"
+    assert body["rows_processed"] == len(unique_rows)
+    assert body["rows_processed"] < len(duplicated_rows)
+    assert set(body["candidates"].keys()) == {
+        "logistic_regression",
+        "random_forest",
+        "xgboost",
+    }
+
+
 def test_train_rejects_empty_rows(api_client: TestClient) -> None:
     response = api_client.post("/train", json=[])
     assert response.status_code == 400
