@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -42,6 +43,26 @@ def _build_row(scale: float) -> dict[str, float]:
     return row
 
 
+def _build_retraining_rows() -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+
+    for scale in range(6):
+        row = _build_row(float(scale))
+        row["error_left_pinky"] = 0.20 + (0.01 * scale)
+        row["error_right_pinky"] = 0.01
+        row["weakest_finger"] = "left_pinky"
+        rows.append(row)
+
+    for scale in range(6, 12):
+        row = _build_row(float(scale))
+        row["error_left_pinky"] = 0.01
+        row["error_right_pinky"] = 0.20 + (0.01 * (scale - 6))
+        row["weakest_finger"] = "right_pinky"
+        rows.append(row)
+
+    return rows
+
+
 class EncodedDummyModel:
     """Minimal model stub that emits encoded class indices."""
 
@@ -71,6 +92,7 @@ class AlgorithmSwitchDummyModel:
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     model_path = tmp_path / "model.joblib"
+    production_model_path = tmp_path / "model_production.joblib"
 
     # Minimal training data just to create a valid artifact with predict_proba.
     rows = [_build_row(0.0), _build_row(1.0), _build_row(2.0), _build_row(3.0)]
@@ -95,6 +117,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     joblib.dump(artifact, model_path)
 
     monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_PATH", str(production_model_path))
 
     # Ensure import side effects pick up patched environment variable.
     if "src.api" in sys.modules:
@@ -257,6 +280,42 @@ def test_predict_uses_algorithm_switch_model(
     body = res.json()
     assert body["prediction"] == "rf_class_a"
     assert set(body["probabilities"].keys()) == {"rf_class_a", "rf_class_b"}
+
+
+def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    retrain_payload = _build_retraining_rows()
+    retrain_response = api_client.post("/train", json=retrain_payload)
+
+    assert retrain_response.status_code == 200
+    body = retrain_response.json()
+    assert body["algorithm"] in {"logistic_regression", "random_forest", "xgboost"}
+    assert 0.0 <= body["accuracy"] <= 1.0
+    assert 0.0 <= body["f1_score"] <= 1.0
+    assert body["rows_processed"] == len(retrain_payload)
+    assert set(body["candidates"].keys()) == {
+        "logistic_regression",
+        "random_forest",
+        "xgboost",
+    }
+
+    metadata_response = api_client.get("/metadata")
+    assert metadata_response.status_code == 200
+    metadata_body = metadata_response.json()
+    assert metadata_body["model_algorithm"] == body["algorithm"]
+    assert metadata_body["model_path"].endswith("model_production.joblib")
+
+    predict_response = api_client.post("/predict", json={"row": _build_row(2.0)})
+    assert predict_response.status_code == 200
+    assert "prediction" in predict_response.json()
+
+
+def test_train_rejects_empty_rows(api_client: TestClient) -> None:
+    response = api_client.post("/train", json=[])
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "rows must be non-empty"
 
 
 def test_create_app_rejects_unsupported_algorithm_env(
