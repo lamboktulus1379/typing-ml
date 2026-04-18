@@ -287,24 +287,42 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
         pytest.skip("xgboost is not installed in this environment")
 
     retrain_payload = _build_retraining_rows()
-    retrain_response = api_client.post("/train", json=retrain_payload)
+    retrain_response = api_client.post(
+        "/train",
+        json={"is_dry_run": False, "rows": retrain_payload},
+    )
 
     assert retrain_response.status_code == 200
     body = retrain_response.json()
-    assert body["algorithm"] in {"logistic_regression", "random_forest", "xgboost"}
-    assert 0.0 <= body["accuracy"] <= 1.0
-    assert 0.0 <= body["f1_score"] <= 1.0
-    assert body["rows_processed"] == len(retrain_payload)
+    assert body["status"] == "success_production"
+    assert body["winning_algorithm"] in {"logistic_regression", "random_forest", "xgboost"}
+    assert 0.0 <= body["winning_f1_score"] <= 1.0
+    assert body["total_rows_processed"] == len(retrain_payload)
+    assert body["algorithm"] == body["winning_algorithm"]
+    assert body["rows_processed"] == body["total_rows_processed"]
+    assert body["trained_rows"] == body["total_rows_processed"]
+    assert body["report_path"].endswith(".json")
+    assert Path(body["report_path"]).exists()
+    assert len(body["leaderboard"]) == 3
+    assert {entry["name"] for entry in body["leaderboard"]} == {
+        "logistic_regression",
+        "random_forest",
+        "xgboost",
+    }
     assert set(body["candidates"].keys()) == {
         "logistic_regression",
         "random_forest",
         "xgboost",
     }
+    for entry in body["leaderboard"]:
+        assert 0.0 <= entry["accuracy"] <= 1.0
+        assert 0.0 <= entry["f1_score"] <= 1.0
+        assert entry["execution_time_ms"] >= 0.0
 
     metadata_response = api_client.get("/metadata")
     assert metadata_response.status_code == 200
     metadata_body = metadata_response.json()
-    assert metadata_body["model_algorithm"] == body["algorithm"]
+    assert metadata_body["model_algorithm"] == body["winning_algorithm"]
     assert metadata_body["model_path"].endswith("model_production.joblib")
 
     predict_response = api_client.post("/predict", json={"row": _build_row(2.0)})
@@ -327,13 +345,41 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success_dry_run"
+    assert body["total_rows_processed"] == len(unique_rows)
     assert body["rows_processed"] == len(unique_rows)
-    assert body["rows_processed"] < len(duplicated_rows)
+    assert body["total_rows_processed"] < len(duplicated_rows)
+    assert body["report_path"].endswith(".json")
+    assert Path(body["report_path"]).exists()
+    assert len(body["leaderboard"]) == 3
     assert set(body["candidates"].keys()) == {
         "logistic_regression",
         "random_forest",
         "xgboost",
     }
+    assert body["algorithm"] == body["winning_algorithm"]
+    assert body["f1_score"] == body["winning_f1_score"]
+
+
+def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    retrain_payload = _build_retraining_rows()
+    response = api_client.post(
+        "/train",
+        json={"is_dry_run": True, "rows": retrain_payload},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    report_path = Path(body["report_path"])
+    report_payload = __import__("json").loads(report_path.read_text(encoding="utf-8"))
+
+    assert report_payload["status"] == "success_dry_run"
+    assert report_payload["is_dry_run"] is True
+    assert report_payload["winning_algorithm"] == body["winning_algorithm"]
+    assert report_payload["total_rows_processed"] == body["total_rows_processed"]
+    assert len(report_payload["leaderboard"]) == 3
 
 
 def test_train_rejects_empty_rows(api_client: TestClient) -> None:

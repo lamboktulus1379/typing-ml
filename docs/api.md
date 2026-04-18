@@ -154,7 +154,7 @@ Request JSON shape:
 
 ### POST `/train`
 
-Purpose: run retraining pipeline with optional dry-run safety mode.
+Purpose: run the thesis "Algorithm Arena" retraining pipeline with optional dry-run safety mode.
 
 Preferred request JSON shape:
 
@@ -198,10 +198,17 @@ Preferred request JSON shape:
 Behavior:
 - The API normalizes and validates rows, then creates a DataFrame.
 - Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
-- Candidate models are trained and evaluated; winner is selected by weighted F1, then accuracy.
+- The payload is split into 80% training data and 20% testing data using `random_state=42`.
+- Three algorithms are trained on the same training split: logistic regression, random forest, and xgboost.
+- Each candidate reports:
+  - `accuracy`
+  - `f1_score` (macro F1)
+  - `execution_time_ms`
+- The winner is chosen by highest macro F1-score.
+- After the winner is selected, that winning algorithm is retrained from scratch on 100% of the payload.
 
 Dry-run mode (`is_dry_run=true`, default):
-- Trains and evaluates candidates.
+- Runs the full arena evaluation and full-data winner retraining.
 - Does NOT save artifact to disk.
 - Does NOT hot-reload runtime model state.
 - Returns status:
@@ -209,28 +216,70 @@ Dry-run mode (`is_dry_run=true`, default):
 ```json
 {
   "status": "success_dry_run",
-  "algorithm": "xgboost",
-  "accuracy": 0.94,
-  "f1_score": 0.91
+  "winning_algorithm": "xgboost",
+  "winning_f1_score": 0.91,
+  "total_rows_processed": 150,
+  "leaderboard": [
+    {
+      "name": "logistic_regression",
+      "accuracy": 0.89,
+      "f1_score": 0.87,
+      "execution_time_ms": 12.5
+    },
+    {
+      "name": "random_forest",
+      "accuracy": 0.92,
+      "f1_score": 0.9,
+      "execution_time_ms": 44.8
+    },
+    {
+      "name": "xgboost",
+      "accuracy": 0.94,
+      "f1_score": 0.91,
+      "execution_time_ms": 57.3
+    }
+  ]
 }
 ```
 
 Production mode (`is_dry_run=false`):
-- Saves winner artifact to production model path.
+- Saves the final full-data winning artifact to the production model path.
 - Hot-reloads active model in API memory.
 - Returns status:
 
 ```json
 {
   "status": "success_production",
-  "algorithm": "xgboost",
-  "accuracy": 0.94,
-  "f1_score": 0.91
+  "winning_algorithm": "xgboost",
+  "winning_f1_score": 0.91,
+  "total_rows_processed": 150,
+  "leaderboard": [
+    {
+      "name": "logistic_regression",
+      "accuracy": 0.89,
+      "f1_score": 0.87,
+      "execution_time_ms": 12.5
+    },
+    {
+      "name": "random_forest",
+      "accuracy": 0.92,
+      "f1_score": 0.9,
+      "execution_time_ms": 44.8
+    },
+    {
+      "name": "xgboost",
+      "accuracy": 0.94,
+      "f1_score": 0.91,
+      "execution_time_ms": 57.3
+    }
+  ]
 }
 ```
 
 Compatibility note:
 - Legacy payloads that post only an array of rows are still accepted and treated as dry-run.
+- Legacy response fields such as `algorithm`, `accuracy`, `f1_score`, and `rows_processed` remain available for older clients.
+- Each `/train` run writes a timestamped JSON report artifact to `reports/retrain_runs/` by default and includes `report_path` in the response.
 
 ## Integration impact for .NET backend / frontend
 
