@@ -136,6 +136,7 @@ make run
 make generate-synthetic
 make train
 make evaluate
+make compare-algorithms
 make ml-pipeline
 make e2e
 make refresh-results
@@ -201,6 +202,15 @@ Run full pipeline and refresh filled results in one command:
 ```bash
 make CONDA_ENV=typing-ml e2e-report
 ```
+
+Compare logistic regression, random forest, and xgboost on the same dataset/split:
+
+```bash
+make CONDA_ENV=typing-ml compare-algorithms
+```
+
+Summary outputs are written to `reports/algorithm_comparison.json` and `reports/algorithm_comparison.md`.
+The markdown report includes quality metrics and efficiency tie-breakers (model size and prediction latency).
 
 ---
 
@@ -630,6 +640,21 @@ Run the API:
 ```bash
 make dev
 # or: make run
+```
+
+Switch the API model by environment variables:
+
+```bash
+export TYPING_ML_MODEL_ALGORITHM=xgboost
+make run
+```
+
+Optional per-algorithm path override:
+
+```bash
+export TYPING_ML_MODEL_ALGORITHM=random_forest
+export TYPING_ML_MODEL_PATH_RANDOM_FOREST=models/model_compare_random_forest.joblib
+make run
 ```
 
 Docs:

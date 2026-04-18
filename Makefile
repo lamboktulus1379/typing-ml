@@ -12,8 +12,11 @@ SESSIONS_PER_USER ?= 20
 SEED ?= 42
 ALGORITHM ?= logistic_regression
 RESULTS_MD ?= reports/results_filled_latest.md
+COMPARE_SUMMARY_PATH ?= reports/algorithm_comparison.json
+COMPARE_MARKDOWN_PATH ?= reports/algorithm_comparison.md
+COMPARE_LATENCY_RUNS ?= 50
 
-.PHONY: help install dev run generate-synthetic train evaluate ml-pipeline e2e refresh-results e2e-report test-api test
+.PHONY: help install dev run generate-synthetic train evaluate compare-algorithms ml-pipeline e2e refresh-results e2e-report test-api test
 
 help:
 	@echo "Available targets:"
@@ -25,6 +28,7 @@ help:
 	@echo "  make train     - Train model from dataset"
 	@echo "    - ALGORITHM=logistic_regression|random_forest|xgboost (default: logistic_regression)"
 	@echo "  make evaluate  - Evaluate model and save confusion matrix"
+	@echo "  make compare-algorithms - Train and compare logistic_regression, random_forest, xgboost"
 	@echo "  make ml-pipeline - Generate data, train, and evaluate"
 	@echo "  make e2e       - Full end-to-end flow (standard thesis pipeline)"
 	@echo "  make refresh-results - Build reports/results_filled_latest.md from latest JSON"
@@ -52,6 +56,9 @@ train:
 
 evaluate:
 	$(PYTHON) src/evaluate.py --data $(DATA_PATH) --model $(MODEL_PATH) --fig-dir $(FIG_DIR) --random-state $(SEED)
+
+compare-algorithms:
+	$(PYTHON) src/compare_algorithms.py --data $(DATA_PATH) --model-dir models --report-dir reports --summary-out $(COMPARE_SUMMARY_PATH) --markdown-out $(COMPARE_MARKDOWN_PATH) --random-state $(SEED) --latency-runs $(COMPARE_LATENCY_RUNS)
 
 ml-pipeline: generate-synthetic train evaluate
 

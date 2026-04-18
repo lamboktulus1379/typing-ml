@@ -45,6 +45,30 @@ class EvaluationService:
             target_validator=TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS),
         )
 
+    @staticmethod
+    def _decode_predictions(predictions: Any, label_classes: Any) -> Any:
+        """Decode integer class predictions into label strings when metadata is present."""
+
+        if not label_classes:
+            return predictions
+
+        classes = list(label_classes)
+        decoded: list[str] = []
+        for value in predictions:
+            if isinstance(value, str):
+                decoded.append(value)
+                continue
+
+            index = int(value)
+            if index < 0 or index >= len(classes):
+                raise ValueError(
+                    "Model prediction index is outside the saved label class range. "
+                    f"index={index}, classes={classes}"
+                )
+            decoded.append(classes[index])
+
+        return decoded
+
     def evaluate(self, config: EvaluationConfig) -> Dict[str, Any]:
         """Run end-to-end evaluation and save confusion matrix artifacts."""
 
@@ -103,7 +127,8 @@ class EvaluationService:
             ) from ex
 
         print("Generating predictions...")
-        predictions = model.predict(x_test)
+        raw_predictions = model.predict(x_test)
+        predictions = self._decode_predictions(raw_predictions, artifact.get("label_classes"))
 
         classification_report_fn = cast(Any, sk_metrics.classification_report)
         report_text = cast(str, classification_report_fn(y_test, predictions))

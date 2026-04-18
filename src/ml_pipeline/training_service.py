@@ -8,6 +8,7 @@ from typing import Any, Dict, cast
 import pandas as pd
 import sklearn.metrics as sk_metrics
 import sklearn.model_selection as sk_model_selection
+from sklearn.preprocessing import LabelEncoder
 
 from .artifacts import ArtifactStore, ModelArtifact
 from .constants import (
@@ -16,7 +17,7 @@ from .constants import (
     TARGET_COLUMN,
     TRAIN_FEATURE_COLUMNS,
 )
-from .model_factory import ModelPipelineFactory
+from .model_factory import Algorithm, ModelPipelineFactory
 from .interfaces import (
     ArtifactStoreProtocol,
     FeatureValidatorProtocol,
@@ -102,9 +103,21 @@ class TrainingService:
 
         print(f"Training algorithm: {config.algorithm}")
         model = cast(Any, self.model_factory.create(config.algorithm))
-        model.fit(x_train, y_train)
+
+        label_encoder: LabelEncoder | None = None
+        y_train_for_fit: Any = y_train
+        if config.algorithm == Algorithm.XGBOOST.value:
+            label_encoder = LabelEncoder()
+            label_encoder.fit(target_series)
+            y_train_for_fit = label_encoder.transform(y_train)
+
+        model.fit(x_train, y_train_for_fit)
 
         predictions = model.predict(x_test)
+        if label_encoder is not None:
+            encoded_predictions = pd.Series(predictions).astype(int).to_numpy()
+            predictions = label_encoder.inverse_transform(encoded_predictions)
+
         classification_report_fn = cast(Any, sk_metrics.classification_report)
         report = cast(
             Dict[str, Any],
@@ -117,6 +130,7 @@ class TrainingService:
             model_name=config.algorithm,
             feature_names=TRAIN_FEATURE_COLUMNS,
             target_name=TARGET_COLUMN,
+            label_classes=(label_encoder.classes_.tolist() if label_encoder is not None else None),
         )
         self.artifact_store.save_model_artifact(artifact, config.model_out)
         self.artifact_store.save_report(report, config.report_out)

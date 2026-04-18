@@ -17,6 +17,7 @@ class ModelArtifact:
     feature_names: list[str]
     target_name: str
     created_at: str
+    label_classes: list[str] | None = None
 
     @classmethod
     def from_training(
@@ -26,6 +27,7 @@ class ModelArtifact:
         model_name: str,
         feature_names: list[str],
         target_name: str,
+        label_classes: list[str] | None = None,
     ) -> "ModelArtifact":
         """Create a model artifact with a UTC creation timestamp."""
 
@@ -35,18 +37,23 @@ class ModelArtifact:
             feature_names=feature_names,
             target_name=target_name,
             created_at=datetime.now(timezone.utc).isoformat(),
+            label_classes=label_classes,
         )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize artifact to a joblib-friendly dictionary."""
 
-        return {
+        artifact = {
             "model": self.model,
             "model_name": self.model_name,
             "feature_names": self.feature_names,
             "target_name": self.target_name,
             "created_at": self.created_at,
         }
+        if self.label_classes:
+            artifact["label_classes"] = self.label_classes
+
+        return artifact
 
 
 @dataclass(frozen=True)

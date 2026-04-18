@@ -1,6 +1,6 @@
 # API Documentation (FastAPI)
 
-This API loads the trained model from `models/model.joblib` and exposes REST endpoints so you can test predictions from Postman/curl.
+This API loads a trained model artifact and exposes REST endpoints so you can test predictions from Postman/curl.
 
 ## Start the server
 
@@ -14,15 +14,39 @@ uvicorn src.api:app --reload --port 8000
 - Swagger UI: http://127.0.0.1:8000/docs
 - ReDoc: http://127.0.0.1:8000/redoc
 
-## Model file
+## Model selection via environment variables
 
-By default the API reads:
-- `models/model.joblib`
+Selection precedence:
+1. `TYPING_ML_MODEL_PATH`
+2. `TYPING_ML_MODEL_ALGORITHM` plus optional `TYPING_ML_MODEL_PATH_<ALGORITHM>`
+3. default `models/model.joblib`
 
-You can override it with an environment variable:
+Supported algorithm values:
+- `logistic_regression`
+- `random_forest`
+- `xgboost`
+
+Examples:
+
+Explicit model path:
 
 ```bash
 export TYPING_ML_MODEL_PATH="models/model.joblib"
+uvicorn src.api:app --reload
+```
+
+Switch by algorithm (uses default compare artifact path):
+
+```bash
+export TYPING_ML_MODEL_ALGORITHM="xgboost"
+uvicorn src.api:app --reload
+```
+
+Switch by algorithm with custom path override:
+
+```bash
+export TYPING_ML_MODEL_ALGORITHM="random_forest"
+export TYPING_ML_MODEL_PATH_RANDOM_FOREST="models/model_compare_random_forest.joblib"
 uvicorn src.api:app --reload
 ```
 
@@ -55,6 +79,8 @@ curl -s http://127.0.0.1:8000/metadata | python -m json.tool
 ```
 
 Response fields:
+- `model_path`: active model artifact path
+- `model_algorithm`: selected algorithm from environment (or artifact metadata fallback)
 - `feature_names`: list of required feature keys (in training order)
 - `classes`: possible labels for `weakest_finger`
 - `created_at`: when the artifact was created (UTC)
