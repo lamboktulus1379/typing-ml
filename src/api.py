@@ -35,6 +35,50 @@ except ModuleNotFoundError:
 MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "4096"))
 logger = logging.getLogger("typing-ml")
 
+DEFAULT_MODEL_PATH = "models/model.joblib"
+DEFAULT_MODEL_PATH_BY_ALGORITHM = {
+    "logistic_regression": "models/model_compare_logistic_regression.joblib",
+    "random_forest": "models/model_compare_random_forest.joblib",
+    "xgboost": "models/model_compare_xgboost.joblib",
+}
+
+
+def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
+    """Resolve model path and selected algorithm from environment variables.
+
+    Selection precedence:
+    1) TYPING_ML_MODEL_PATH
+    2) TYPING_ML_MODEL_ALGORITHM + optional TYPING_ML_MODEL_PATH_<ALGORITHM>
+    3) default model path
+    """
+
+    explicit_model_path = os.getenv("TYPING_ML_MODEL_PATH")
+    selected_algorithm_raw = os.getenv("TYPING_ML_MODEL_ALGORITHM")
+    selected_algorithm = (
+        selected_algorithm_raw.strip().lower() if selected_algorithm_raw else None
+    )
+
+    if explicit_model_path:
+        return explicit_model_path, selected_algorithm
+
+    if selected_algorithm:
+        if selected_algorithm not in DEFAULT_MODEL_PATH_BY_ALGORITHM:
+            raise RuntimeError(
+                "Unsupported TYPING_ML_MODEL_ALGORITHM='"
+                f"{selected_algorithm}'. Supported values: "
+                f"{sorted(DEFAULT_MODEL_PATH_BY_ALGORITHM.keys())}"
+            )
+
+        algorithm_specific_path = os.getenv(
+            f"TYPING_ML_MODEL_PATH_{selected_algorithm.upper()}"
+        )
+        if algorithm_specific_path:
+            return algorithm_specific_path, selected_algorithm
+
+        return DEFAULT_MODEL_PATH_BY_ALGORITHM[selected_algorithm], selected_algorithm
+
+    return DEFAULT_MODEL_PATH, None
+
 
 def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS) -> str:
     """Convert payload to text and cap it to avoid oversized trace attributes."""
@@ -111,11 +155,47 @@ def start_model_inference_span(span_name: str, row_count: int, feature_count: in
 class InferenceService:
     """Application service for schema-aware inference and metadata access."""
 
-    def __init__(self, model: Any, artifact: Dict[str, Any], model_path: str) -> None:
+    def __init__(
+        self,
+        model: Any,
+        artifact: Dict[str, Any],
+        model_path: str,
+        model_algorithm: Optional[str] = None,
+    ) -> None:
         self.model = model
         self.artifact = artifact
         self.model_path = model_path
+        self.model_algorithm = model_algorithm or artifact.get("model_name")
         self.feature_names: Optional[List[str]] = artifact.get("feature_names")
+        self.label_classes: Optional[List[str]] = artifact.get("label_classes")
+
+    def _decode_label(self, value: Any) -> Any:
+        """Decode model output label when artifact stores encoded class mapping."""
+
+        if not self.label_classes or isinstance(value, str):
+            return value
+
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return value
+
+        if index < 0 or index >= len(self.label_classes):
+            return value
+
+        return self.label_classes[index]
+
+    def _resolve_output_classes(self) -> Optional[List[Any]]:
+        """Resolve classes used by predict_proba output and decode if needed."""
+
+        classes = getattr(self.model, "classes_", None)
+        if classes is None:
+            clf = getattr(self.model, "named_steps", {}).get("clf", self.model)
+            classes = getattr(clf, "classes_", None)
+        if classes is None:
+            return None
+
+        return [self._decode_label(class_value) for class_value in classes]
 
     def build_frame(self, rows: List[Dict[str, float]]) -> pd.DataFrame:
         """Build a prediction frame and enforce training feature schema when available."""
@@ -138,10 +218,11 @@ class InferenceService:
     def get_metadata(self) -> Dict[str, Any]:
         """Return metadata used by clients to shape prediction requests."""
 
-        classes = getattr(getattr(self.model, "named_steps", {}).get("clf", self.model), "classes_", None)
-        classes_list = list(classes) if classes is not None else None
+        classes = self._resolve_output_classes()
+        classes_list = [str(class_value) for class_value in classes] if classes is not None else None
         return {
             "model_path": self.model_path,
+            "model_algorithm": self.model_algorithm,
             "target_name": self.artifact.get("target_name", "weakest_finger"),
             "feature_names": self.feature_names,
             "classes": classes_list,
@@ -152,16 +233,13 @@ class InferenceService:
         """Predict one row and optionally include class probabilities."""
 
         dataframe = self.build_frame([row])
-        prediction = self.model.predict(dataframe)[0]
+        prediction = self._decode_label(self.model.predict(dataframe)[0])
         result: Dict[str, Any] = {"prediction": prediction}
 
         has_predict_proba = hasattr(self.model, "predict_proba")
         if has_predict_proba:
             probs = self.model.predict_proba(dataframe)[0]
-            classes = getattr(self.model, "classes_", None)
-            if classes is None:
-                clf = getattr(self.model, "named_steps", {}).get("clf")
-                classes = getattr(clf, "classes_", None)
+            classes = self._resolve_output_classes()
             if classes is not None:
                 result["probabilities"] = {str(c): float(p) for c, p in zip(classes, probs)}
 
@@ -175,13 +253,12 @@ class InferenceService:
 
         dataframe = self.build_frame(rows)
         predictions = self.model.predict(dataframe)
-        out: Dict[str, Any] = {"predictions": [p for p in predictions]}
+        out: Dict[str, Any] = {"predictions": [self._decode_label(prediction) for prediction in predictions]}
 
         has_predict_proba = hasattr(self.model, "predict_proba")
         if has_predict_proba:
             probas = self.model.predict_proba(dataframe)
-            clf = getattr(self.model, "named_steps", {}).get("clf", self.model)
-            classes = getattr(clf, "classes_", None)
+            classes = self._resolve_output_classes()
             if classes is not None:
                 out["probabilities"] = [
                     {str(c): float(p) for c, p in zip(classes, row_probs)}
@@ -300,14 +377,16 @@ def create_app() -> FastAPI:
             background=response.background,
         )
 
-    model_path = os.getenv("TYPING_ML_MODEL_PATH", "models/model.joblib")
+    model_path, selected_algorithm = resolve_model_selection_from_env()
     artifact_store = ArtifactStore()
     with start_model_internal_span("typing-ml.model.load", attributes={"typing.ml.model.path": model_path}) as span:
         model, artifact = artifact_store.load_model_artifact(model_path)
         if span is not None and span.is_recording():
             span.set_attribute("typing.ml.model.class", model.__class__.__name__)
+            if selected_algorithm:
+                span.set_attribute("typing.ml.model.algorithm", selected_algorithm)
 
-    inference_service = InferenceService(model, artifact, model_path)
+    inference_service = InferenceService(model, artifact, model_path, selected_algorithm)
 
     @app.get(
         "/health",
