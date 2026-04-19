@@ -96,18 +96,23 @@ class TrainingArenaService:
         dataframe: pd.DataFrame,
         *,
         algorithms: Sequence[str],
+        user_id: str | None = None,
     ) -> AlgorithmArenaResult:
         """Run split evaluation, pick a winner, and retrain it on the full dataset."""
 
         if dataframe.empty:
             raise ValueError("Retraining payload is empty. Provide at least one row.")
 
+        filtered_dataframe = self._filter_dataframe_for_user(dataframe, user_id=user_id)
+        if filtered_dataframe.empty:
+            raise ValueError("Retraining payload is empty after user_id filtering.")
+
         if TARGET_COLUMN not in dataframe.columns:
             raise ValueError(
                 f"Retraining payload is missing required target column '{TARGET_COLUMN}'."
             )
 
-        normalized_dataframe = dataframe.drop_duplicates().reset_index(drop=True)
+        normalized_dataframe = filtered_dataframe.drop_duplicates().reset_index(drop=True)
         if normalized_dataframe.empty:
             raise ValueError("Retraining payload contains zero unique rows after deduplication.")
 
@@ -181,6 +186,29 @@ class TrainingArenaService:
             retrained_model=retrained_model,
             retrained_label_classes=retrained_label_classes,
         )
+
+    @staticmethod
+    def _filter_dataframe_for_user(dataframe: pd.DataFrame, *, user_id: str | None) -> pd.DataFrame:
+        """Reduce the payload to one requested user before train/test splitting."""
+
+        if user_id is None:
+            return dataframe.copy()
+
+        normalized_user_id = user_id.strip().casefold()
+        if not normalized_user_id:
+            raise ValueError("Retraining payload user_id must be non-empty.")
+
+        if "user_id" not in dataframe.columns:
+            raise ValueError("Retraining payload is missing required user_id column for personalized training.")
+
+        filtered_dataframe = dataframe[
+            dataframe["user_id"].astype(str).str.strip().str.casefold() == normalized_user_id
+        ].copy()
+
+        if filtered_dataframe.empty:
+            raise ValueError(f"No retraining rows found for user_id '{user_id}'.")
+
+        return filtered_dataframe.reset_index(drop=True)
 
     def _evaluate_algorithm(
         self,

@@ -41,6 +41,7 @@ def _build_training_frame() -> pd.DataFrame:
 
     for scale in range(6):
         row = _build_row(float(scale))
+        row["user_id"] = "user-a"
         row["error_left_pinky"] = 0.25 + (0.01 * scale)
         row["error_right_index"] = 0.02
         row["weakest_finger"] = "left_pinky"
@@ -48,6 +49,7 @@ def _build_training_frame() -> pd.DataFrame:
 
     for scale in range(6, 12):
         row = _build_row(float(scale))
+        row["user_id"] = "user-a"
         row["error_left_pinky"] = 0.02
         row["error_right_index"] = 0.25 + (0.01 * (scale - 6))
         row["weakest_finger"] = "right_index"
@@ -109,3 +111,20 @@ def test_run_algorithm_arena_requires_algorithms() -> None:
         assert "No candidate algorithms" in str(ex)
     else:
         raise AssertionError("Expected ValueError when no algorithms are provided")
+
+
+def test_run_algorithm_arena_filters_rows_to_requested_user_before_split() -> None:
+    service = TrainingArenaService.default(random_state=42)
+    user_a_rows = _build_training_frame()
+    user_b_rows = user_a_rows.copy(deep=True)
+    user_b_rows["user_id"] = "user-b"
+    combined = pd.concat([user_a_rows, user_b_rows], ignore_index=True)
+
+    result = service.run_algorithm_arena(
+        combined,
+        algorithms=("logistic_regression", "random_forest", "xgboost"),
+        user_id="user-b",
+    )
+
+    assert result.total_rows_processed == len(user_b_rows)
+    assert result.winning_algorithm in {"logistic_regression", "random_forest", "xgboost"}
