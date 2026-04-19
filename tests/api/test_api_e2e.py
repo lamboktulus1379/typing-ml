@@ -11,6 +11,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 FINGERS = [
     "left_pinky",
     "left_ring",
@@ -92,7 +97,8 @@ class AlgorithmSwitchDummyModel:
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     model_path = tmp_path / "model.joblib"
-    production_model_path = tmp_path / "model_production.joblib"
+    production_model_dir = tmp_path / "production"
+    active_model_metadata_path = tmp_path / "active_production_model.json"
 
     # Minimal training data just to create a valid artifact with predict_proba.
     rows = [_build_row(0.0), _build_row(1.0), _build_row(2.0), _build_row(3.0)]
@@ -117,7 +123,8 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     joblib.dump(artifact, model_path)
 
     monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(model_path))
-    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_PATH", str(production_model_path))
+    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
+    monkeypatch.setenv("TYPING_ML_ACTIVE_MODEL_METADATA_PATH", str(active_model_metadata_path))
 
     # Ensure import side effects pick up patched environment variable.
     if "src.api" in sys.modules:
@@ -301,6 +308,11 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert body["algorithm"] == body["winning_algorithm"]
     assert body["rows_processed"] == body["total_rows_processed"]
     assert body["trained_rows"] == body["total_rows_processed"]
+    assert body["model_path"].endswith(".joblib")
+    assert "typing-prod-" in body["model_path"]
+    assert Path(body["model_path"]).exists()
+    assert body["active_model_metadata_path"].endswith("active_production_model.json")
+    assert Path(body["active_model_metadata_path"]).exists()
     assert body["report_path"].endswith(".json")
     assert Path(body["report_path"]).exists()
     assert len(body["leaderboard"]) == 3
@@ -323,7 +335,14 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert metadata_response.status_code == 200
     metadata_body = metadata_response.json()
     assert metadata_body["model_algorithm"] == body["winning_algorithm"]
-    assert metadata_body["model_path"].endswith("model_production.joblib")
+    assert metadata_body["model_path"] == body["model_path"]
+    assert metadata_body["active_model_metadata_path"] == body["active_model_metadata_path"]
+
+    pointer_payload = __import__("json").loads(
+        Path(body["active_model_metadata_path"]).read_text(encoding="utf-8")
+    )
+    assert pointer_payload["model_path"] == body["model_path"]
+    assert pointer_payload["model_algorithm"] == body["winning_algorithm"]
 
     predict_response = api_client.post("/predict", json={"row": _build_row(2.0)})
     assert predict_response.status_code == 200
@@ -399,3 +418,52 @@ def test_create_app_rejects_unsupported_algorithm_env(
 
     with pytest.raises(RuntimeError, match="Unsupported TYPING_ML_MODEL_ALGORITHM"):
         importlib.import_module("src.api")
+
+
+def test_metadata_uses_active_model_pointer_when_no_explicit_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production_model_path = tmp_path / "production" / "typing-prod-20260419T120000_000000Z-random_forest.joblib"
+    active_model_metadata_path = tmp_path / "active_production_model.json"
+
+    production_model_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "model": AlgorithmSwitchDummyModel(),
+        "model_name": "random_forest",
+        "feature_names": FEATURE_NAMES,
+        "target_name": "weakest_finger",
+        "label_classes": ["rf_class_a", "rf_class_b"],
+        "created_at": "2026-04-19T12:00:00+00:00",
+    }
+    joblib.dump(artifact, production_model_path)
+    active_model_metadata_path.write_text(
+        __import__("json").dumps(
+            {
+                "model_path": str(production_model_path),
+                "model_algorithm": "random_forest",
+                "promoted_at": "2026-04-19T12:01:00+00:00",
+                "created_at": "2026-04-19T12:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("TYPING_ML_MODEL_PATH", raising=False)
+    monkeypatch.delenv("TYPING_ML_MODEL_ALGORITHM", raising=False)
+    monkeypatch.delenv("TYPING_ML_MODEL_PATH_RANDOM_FOREST", raising=False)
+    monkeypatch.setenv("TYPING_ML_ACTIVE_MODEL_METADATA_PATH", str(active_model_metadata_path))
+
+    if "src.api" in sys.modules:
+        del sys.modules["src.api"]
+    api_module = importlib.import_module("src.api")
+
+    app = api_module.create_app()
+    client = TestClient(app)
+
+    res = client.get("/metadata")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["model_path"] == str(production_model_path)
+    assert body["model_algorithm"] == "random_forest"
+    assert body["active_model_metadata_path"] == str(active_model_metadata_path)

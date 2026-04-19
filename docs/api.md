@@ -19,7 +19,9 @@ uvicorn src.api:app --reload --port 8000
 Selection precedence:
 1. `TYPING_ML_MODEL_PATH`
 2. `TYPING_ML_MODEL_ALGORITHM` plus optional `TYPING_ML_MODEL_PATH_<ALGORITHM>`
-3. default `models/model.joblib`
+3. `models/active_production_model.json` when it exists and points to a valid promoted artifact
+4. legacy `TYPING_ML_PRODUCTION_MODEL_PATH` / `models/model_production.joblib` when present
+5. default `models/model.joblib`
 
 Supported algorithm values:
 - `logistic_regression`
@@ -84,6 +86,7 @@ Response fields:
 - `feature_names`: list of required feature keys (in training order)
 - `classes`: possible labels for `weakest_finger`
 - `created_at`: when the artifact was created (UTC)
+- `active_model_metadata_path`: pointer file describing the currently promoted production artifact when available
 
 ### POST `/predict`
 
@@ -243,7 +246,8 @@ Dry-run mode (`is_dry_run=true`, default):
 ```
 
 Production mode (`is_dry_run=false`):
-- Saves the final full-data winning artifact to the production model path.
+- Saves the final full-data winning artifact to a new timestamped path under `models/production/`.
+- Updates the active-model pointer file at `models/active_production_model.json`.
 - Hot-reloads active model in API memory.
 - Returns status:
 
@@ -280,6 +284,7 @@ Compatibility note:
 - Legacy payloads that post only an array of rows are still accepted and treated as dry-run.
 - Legacy response fields such as `algorithm`, `accuracy`, `f1_score`, and `rows_processed` remain available for older clients.
 - Each `/train` run writes a timestamped JSON report artifact to `reports/retrain_runs/` by default and includes `report_path` in the response.
+- Each production `/train` run writes a new immutable model artifact and includes both `model_path` and `active_model_metadata_path` in the response.
 
 ## Integration impact for .NET backend / frontend
 
