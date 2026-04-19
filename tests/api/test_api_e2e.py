@@ -300,7 +300,7 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     retrain_payload = _build_retraining_rows()
     retrain_response = api_client.post(
         "/train",
-        json={"is_dry_run": False, "rows": retrain_payload},
+        json={"userId": "user-test-1", "is_dry_run": False, "rows": retrain_payload},
     )
 
     assert retrain_response.status_code == 200
@@ -337,6 +337,7 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert pointer_payload["model_algorithm"] == body["winningAlgorithmName"]
     assert pointer_payload["model_path"].endswith(".joblib")
     assert "typing-prod-" in pointer_payload["model_path"]
+    assert "user-test-1" in pointer_payload["model_path"]
     assert Path(pointer_payload["model_path"]).exists()
 
     report_dir = Path(api_client.app.extra["train_reports_dir"])
@@ -368,7 +369,7 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
 
     response = api_client.post(
         "/train",
-        json={"is_dry_run": True, "rows": duplicated_rows},
+        json={"userId": "user-test-1", "is_dry_run": True, "rows": duplicated_rows},
     )
 
     assert response.status_code == 200
@@ -405,7 +406,7 @@ def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
     retrain_payload = _build_retraining_rows()
     response = api_client.post(
         "/train",
-        json={"is_dry_run": True, "rows": retrain_payload},
+        json={"userId": "user-test-1", "is_dry_run": True, "rows": retrain_payload},
     )
 
     assert response.status_code == 200
@@ -424,9 +425,44 @@ def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
 
 
 def test_train_rejects_empty_rows(api_client: TestClient) -> None:
-    response = api_client.post("/train", json=[])
+    response = api_client.post("/train", json={"userId": "user-test-1", "rows": []})
     assert response.status_code == 400
     assert response.json()["detail"]["error"] == "rows must be non-empty"
+
+
+def test_train_filters_rows_to_requested_user(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    retrain_payload = _build_retraining_rows()
+    mixed_rows = []
+    target_indexes = {0, 1, 2, 6, 7, 8}
+    for index, row in enumerate(retrain_payload):
+        mixed_row = dict(row)
+        mixed_row["userId"] = "user-target" if index in target_indexes else "user-other"
+        mixed_rows.append(mixed_row)
+
+    response = api_client.post(
+        "/train",
+        json={"userId": "user-target", "is_dry_run": True, "rows": mixed_rows},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+    }
+
+    report_dir = Path(api_client.app.extra["train_reports_dir"])
+    report_files = sorted(report_dir.glob("train_success_dry_run_*.json"))
+    assert report_files
+    report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
+    assert report_payload["total_rows_processed"] == len(target_indexes)
 
 
 def test_create_app_rejects_unsupported_algorithm_env(

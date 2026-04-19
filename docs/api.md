@@ -163,6 +163,7 @@ Preferred request JSON shape:
 
 ```json
 {
+  "user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74",
   "is_dry_run": true,
   "rows": [
     {
@@ -200,6 +201,7 @@ Preferred request JSON shape:
 
 Behavior:
 - The API normalizes and validates rows, then creates a DataFrame.
+- When `user_id` is provided, the API filters the DataFrame to rows for that user before deduplication and before the 80/20 split.
 - Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
 - The payload is split into 80% training data and 20% testing data using `random_state=42`.
 - Three algorithms are trained on the same training split: logistic regression, random forest, and xgboost.
@@ -246,7 +248,7 @@ Dry-run mode (`is_dry_run=true`, default):
 ```
 
 Production mode (`is_dry_run=false`):
-- Saves the final full-data winning artifact to a new timestamped path under `models/production/`.
+- Saves the final full-data winning artifact to a new timestamped per-user path under `models/production/`.
 - Updates the active-model pointer file at `models/active_production_model.json`.
 - Hot-reloads active model in API memory.
 - Returns status:
@@ -282,6 +284,7 @@ Production mode (`is_dry_run=false`):
 
 Compatibility note:
 - Legacy payloads that post only an array of rows are still accepted and treated as dry-run.
+- FastAPI accepts both `user_id` and `userId` request keys for orchestrator compatibility.
 - Legacy response fields such as `algorithm`, `accuracy`, `f1_score`, and `rows_processed` remain available for older clients.
 - Each `/train` run writes a timestamped JSON report artifact to `reports/retrain_runs/` by default and includes `report_path` in the response.
 - Each production `/train` run writes a new immutable model artifact and includes both `model_path` and `active_model_metadata_path` in the response.

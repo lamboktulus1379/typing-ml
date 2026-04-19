@@ -18,6 +18,7 @@ Then open:
 import os
 import logging
 import json
+import re
 from datetime import datetime, timezone
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence, cast
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
     from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
@@ -91,12 +92,24 @@ def resolve_active_model_metadata_path() -> str:
     )
 
 
-def build_production_model_artifact_path(algorithm: str) -> str:
+def _sanitize_user_id_for_path(user_id: str) -> str:
+    """Normalize a user id into a filesystem-safe path segment."""
+
+    normalized_user_id = user_id.strip().lower()
+    sanitized = re.sub(r"[^a-z0-9_-]+", "_", normalized_user_id)
+    return sanitized.strip("_") or "anonymous"
+
+
+def build_production_model_artifact_path(algorithm: str, user_id: Optional[str] = None) -> str:
     """Create a unique immutable artifact path for one promoted production model."""
 
     models_dir = os.getenv("TYPING_ML_PRODUCTION_MODEL_DIR", DEFAULT_PRODUCTION_MODEL_DIR)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     normalized_algorithm = algorithm.strip().lower()
+    if user_id and user_id.strip():
+        sanitized_user_id = _sanitize_user_id_for_path(user_id)
+        return os.path.join(models_dir, f"typing-prod-{timestamp}-{sanitized_user_id}-{normalized_algorithm}.joblib")
+
     return os.path.join(models_dir, f"typing-prod-{timestamp}-{normalized_algorithm}.joblib")
 
 
@@ -449,12 +462,24 @@ class PredictBatchRequest(BaseModel):
 class TypingSessionTrainingData(TypingSessionData):
     """Retraining row payload schema including supervised target label."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     weakest_finger: str
+    user_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
 
 
 class RetrainRequest(BaseModel):
     """Retraining payload contract with dry-run safety mode."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
     rows: List[TypingSessionTrainingData]
     is_dry_run: bool = Field(
         default=True,
@@ -687,9 +712,11 @@ def create_app() -> FastAPI:
         if isinstance(payload, list):
             rows = payload
             is_dry_run = True
+            requested_user_id: Optional[str] = None
         else:
             rows = payload.rows
             is_dry_run = payload.is_dry_run
+            requested_user_id = payload.user_id.strip()
 
         if not rows:
             raise HTTPException(status_code=400, detail={"error": "rows must be non-empty"})
@@ -706,6 +733,9 @@ def create_app() -> FastAPI:
                 row_payload = row.model_dump()
                 row_payload[TARGET_COLUMN] = str(row_payload[TARGET_COLUMN]).strip().lower()
 
+                if requested_user_id is not None and not row_payload.get("user_id"):
+                    row_payload["user_id"] = requested_user_id
+
                 # Accept legacy percentage-style accuracy and normalize to ratio.
                 accuracy_value = float(row_payload["accuracy"])
                 if 1.0 < accuracy_value <= 100.0:
@@ -719,6 +749,7 @@ def create_app() -> FastAPI:
                 arena_result = training_service.run_algorithm_arena(
                     dataframe,
                     algorithms=retrain_algorithms,
+                    user_id=requested_user_id,
                 )
             except ValueError as ex:
                 raise HTTPException(
@@ -780,7 +811,10 @@ def create_app() -> FastAPI:
                 target_name=TARGET_COLUMN,
                 label_classes=arena_result.retrained_label_classes,
             )
-            production_model_path = build_production_model_artifact_path(arena_result.winning_algorithm)
+            production_model_path = build_production_model_artifact_path(
+                arena_result.winning_algorithm,
+                requested_user_id,
+            )
             artifact_store.save_model_artifact(winner_artifact, production_model_path)
             artifact_store.save_json(
                 {

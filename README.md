@@ -66,7 +66,8 @@ It now follows an "Algorithm Arena" evaluation flow:
   - training execution time in milliseconds
 6. Select the winner by highest macro F1-score.
 7. Retrain the winning algorithm from scratch on 100% of the dataset.
-8. If `is_dry_run` is `false`, save a new immutable production artifact, update the active-model pointer, and hot-reload the in-memory model.
+8. If `user_id` is present, filter the payload to that user before deduplication and before the 80/20 split.
+9. If `is_dry_run` is `false`, save a new immutable production artifact, update the active-model pointer, and hot-reload the in-memory model.
 
 This gives you two layers of evidence for thesis reporting:
 
@@ -76,7 +77,7 @@ This gives you two layers of evidence for thesis reporting:
 The `/train` response includes a leaderboard for all three candidate algorithms plus winner metadata.
 
 Production artifact behavior:
-- Every non-dry-run training writes a new timestamped artifact under `models/production/`.
+- Every non-dry-run training writes a new timestamped artifact under `models/production/`, and personalized retrains inject the user id into the filename.
 - The API updates `models/active_production_model.json` to point at the latest promoted artifact.
 - Previous production artifacts remain on disk for rollback or comparison.
 
