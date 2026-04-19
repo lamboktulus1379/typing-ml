@@ -59,9 +59,12 @@ logger = logging.getLogger("typing-ml")
 
 DEFAULT_MODEL_PATH = "models/model.joblib"
 DEFAULT_PRODUCTION_MODEL_PATH = "models/model_production.joblib"
+DEFAULT_GLOBAL_PRODUCTION_MODEL_PATH = "models/model_production_global.joblib"
+DEFAULT_PERSONAL_PRODUCTION_MODEL_TEMPLATE = "models/model_production_{user_id}.joblib"
 DEFAULT_PRODUCTION_MODEL_DIR = "models/production"
 DEFAULT_ACTIVE_MODEL_METADATA_PATH = "models/active_production_model.json"
 DEFAULT_TRAIN_REPORTS_DIR = "reports/retrain_runs"
+DEFAULT_TRAINING_DATASET_PATH = "data/processed/dataset.csv"
 DEFAULT_RETRAIN_RANDOM_STATE = int(os.getenv("TYPING_ML_RETRAIN_RANDOM_STATE", "42"))
 DEFAULT_RETRAIN_ALGORITHMS: tuple[str, ...] = (
     Algorithm.LOGISTIC_REGRESSION.value,
@@ -232,37 +235,19 @@ def resolve_global_fallback_model_path() -> str:
 
     return os.getenv(
         "TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH",
-        os.getenv("TYPING_ML_PRODUCTION_MODEL_PATH", DEFAULT_PRODUCTION_MODEL_PATH),
+        DEFAULT_GLOBAL_PRODUCTION_MODEL_PATH,
     )
 
 
 def resolve_personalized_model_path(user_id: str) -> str:
-    """Resolve the preferred personalized model path for one user.
-
-    Preference order:
-    1. Explicit template override via environment variable
-    2. Latest immutable production artifact matching the sanitized user id
-    3. Legacy fixed per-user production artifact path
-    """
+    """Resolve the preferred personalized model path for one user."""
 
     sanitized_user_id = _sanitize_user_id_for_path(user_id)
-    explicit_template = os.getenv("TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE")
-    if explicit_template:
-        return explicit_template.format(user_id=sanitized_user_id)
-
-    production_dir = os.getenv("TYPING_ML_PRODUCTION_MODEL_DIR", DEFAULT_PRODUCTION_MODEL_DIR)
-    if os.path.isdir(production_dir):
-        matched_artifacts = sorted(
-            os.path.join(production_dir, file_name)
-            for file_name in os.listdir(production_dir)
-            if file_name.endswith(".joblib")
-            and file_name.startswith("typing-prod-")
-            and f"-{sanitized_user_id}-" in file_name
-        )
-        if matched_artifacts:
-            return matched_artifacts[-1]
-
-    return os.path.join("models", f"model_production_{sanitized_user_id}.joblib")
+    template = os.getenv(
+        "TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE",
+        DEFAULT_PERSONAL_PRODUCTION_MODEL_TEMPLATE,
+    )
+    return template.format(user_id=sanitized_user_id)
 
 
 def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS) -> str:
@@ -534,6 +519,18 @@ class RetrainRequest(BaseModel):
     )
 
 
+class PersonalTrainRequest(BaseModel):
+    """Dataset-backed personalized training request with optional inline rows."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
+    rows: List[TypingSessionTrainingData] = Field(default_factory=list)
+
+
 class TrainEvaluationResponse(BaseModel):
     """Per-algorithm evaluation payload for the .NET orchestrator."""
 
@@ -694,6 +691,7 @@ def create_app() -> FastAPI:
         target_validator=target_validator,
         random_state=DEFAULT_RETRAIN_RANDOM_STATE,
     )
+    training_dataset_path = os.getenv("TYPING_ML_TRAINING_DATASET_PATH", DEFAULT_TRAINING_DATASET_PATH)
 
     def get_runtime_snapshot() -> RuntimeInferenceState:
         with runtime_lock:
@@ -716,12 +714,64 @@ def create_app() -> FastAPI:
         )
         return service, model
 
+    def load_global_runtime() -> tuple[InferenceService, Any]:
+        """Load or reuse the configured global baseline inference service."""
+
+        global_model_path = resolve_global_fallback_model_path()
+        runtime_snapshot = get_runtime_snapshot()
+        if os.path.abspath(runtime_snapshot.inference_service.model_path) == os.path.abspath(global_model_path):
+            return runtime_snapshot.inference_service, runtime_snapshot.model
+
+        return load_inference_service_for_model_path(global_model_path)
+
+    def build_train_response(arena_result: Any) -> TrainOrchestratorResponse:
+        evaluations = [
+            TrainEvaluationResponse(
+                algorithmName=entry.name,
+                accuracy=entry.accuracy,
+                f1Score=entry.f1_score,
+                executionTimeMs=int(round(entry.execution_time_ms)),
+            )
+            for entry in arena_result.leaderboard
+        ]
+        return TrainOrchestratorResponse(
+            winningAlgorithmName=arena_result.winning_algorithm,
+            macroPrecision=arena_result.macro_precision,
+            macroRecall=arena_result.macro_recall,
+            topPredictiveFeature=arena_result.top_predictive_feature,
+            primaryMisclassification=arena_result.primary_misclassification,
+            evaluations=evaluations,
+        )
+
+    def normalize_retraining_rows(
+        rows: List[TypingSessionTrainingData],
+        *,
+        requested_user_id: Optional[str],
+    ) -> pd.DataFrame:
+        """Normalize retraining rows for row-backed train endpoints."""
+
+        normalized_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            row_payload = row.model_dump()
+            row_payload[TARGET_COLUMN] = str(row_payload[TARGET_COLUMN]).strip().lower()
+
+            if requested_user_id is not None and not row_payload.get("user_id"):
+                row_payload["user_id"] = requested_user_id
+
+            accuracy_value = float(row_payload["accuracy"])
+            if 1.0 < accuracy_value <= 100.0:
+                row_payload["accuracy"] = accuracy_value / 100.0
+
+            normalized_rows.append(row_payload)
+
+        return pd.DataFrame(normalized_rows)
+
     def resolve_predict_runtime(user_id: Optional[str]) -> tuple[InferenceService, Any, bool]:
         """Resolve personalized inference first, then fall back to the global baseline."""
 
-        runtime_snapshot = get_runtime_snapshot()
         if not user_id or not user_id.strip():
-            return runtime_snapshot.inference_service, runtime_snapshot.model, False
+            runtime_snapshot = get_runtime_snapshot()
+            return runtime_snapshot.inference_service, runtime_snapshot.model, True
 
         normalized_user_id = user_id.strip()
         personalized_model_path = resolve_personalized_model_path(normalized_user_id)
@@ -730,15 +780,120 @@ def create_app() -> FastAPI:
             personalized_service, personalized_model = load_inference_service_for_model_path(personalized_model_path)
             return personalized_service, personalized_model, False
         except FileNotFoundError:
-            global_model_path = resolve_global_fallback_model_path()
-            logger.info(
+            logger.warning(
                 "Personalized model not found for user_id=%s at path=%s. Falling back to global model path=%s",
                 normalized_user_id,
                 personalized_model_path,
-                global_model_path,
+                resolve_global_fallback_model_path(),
             )
-            global_service, global_model = load_inference_service_for_model_path(global_model_path)
+            global_service, global_model = load_global_runtime()
             return global_service, global_model, True
+
+    @app.post(
+        "/train/global",
+        summary="Train global production model",
+        description="Load the processed dataset, train the global model, save it as models/model_production_global.joblib, and return the evaluation report.",
+        response_model=TrainOrchestratorResponse,
+    )
+    def train_global() -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
+        """Train the global model from the persisted dataset and hot-reload global inference."""
+
+        if not training_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail={"error": "Retraining is already in progress"})
+
+        try:
+            try:
+                persisted_result = training_service.train_global_model(
+                    data_path=training_dataset_path,
+                    algorithms=retrain_algorithms,
+                    artifact_store=artifact_store,
+                    model_output_path=resolve_global_fallback_model_path(),
+                )
+            except ValueError as ex:
+                raise HTTPException(status_code=400, detail={"error": str(ex)}) from ex
+            except RuntimeError as ex:
+                raise HTTPException(status_code=500, detail={"error": str(ex)}) from ex
+
+            response = build_train_response(persisted_result.arena_result)
+            new_service = InferenceService(
+                persisted_result.arena_result.retrained_model,
+                persisted_result.artifact.to_dict(),
+                persisted_result.model_output_path,
+                persisted_result.arena_result.winning_algorithm,
+            )
+            replace_runtime_state(
+                RuntimeInferenceState(
+                    inference_service=new_service,
+                    model=persisted_result.arena_result.retrained_model,
+                )
+            )
+            persist_train_report(
+                artifact_store,
+                response,
+                status="success_global_production",
+                is_dry_run=False,
+                random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                total_rows_processed=persisted_result.arena_result.total_rows_processed,
+                model_path=persisted_result.model_output_path,
+            )
+            return response
+        finally:
+            training_lock.release()
+
+    @app.post(
+        "/train/personal",
+        summary="Train personalized production model",
+        description="Load the processed dataset, filter it to one user, save the winner as models/model_production_{user_id}.joblib, and return the evaluation report.",
+        response_model=TrainOrchestratorResponse,
+    )
+    def train_personal(payload: PersonalTrainRequest) -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
+        """Train one personalized model from the persisted dataset."""
+
+        if not training_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail={"error": "Retraining is already in progress"})
+
+        try:
+            requested_user_id = payload.user_id.strip()
+            input_dataframe: Optional[pd.DataFrame] = None
+            if payload.rows:
+                input_dataframe = normalize_retraining_rows(
+                    payload.rows,
+                    requested_user_id=requested_user_id,
+                )
+
+            try:
+                persisted_result = training_service.train_personal_model(
+                    user_id=requested_user_id,
+                    data_path=training_dataset_path,
+                    dataframe=input_dataframe,
+                    algorithms=retrain_algorithms,
+                    artifact_store=artifact_store,
+                    model_output_path_template=os.getenv(
+                        "TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE",
+                        DEFAULT_PERSONAL_PRODUCTION_MODEL_TEMPLATE,
+                    ),
+                )
+            except ValueError as ex:
+                detail = str(ex)
+                if detail == "Insufficient data":
+                    raise HTTPException(status_code=400, detail=detail) from ex
+                raise HTTPException(status_code=400, detail={"error": detail}) from ex
+            except RuntimeError as ex:
+                raise HTTPException(status_code=500, detail={"error": str(ex)}) from ex
+
+            response = build_train_response(persisted_result.arena_result)
+            persist_train_report(
+                artifact_store,
+                response,
+                status="success_personal_production",
+                is_dry_run=False,
+                random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                total_rows_processed=persisted_result.arena_result.total_rows_processed,
+                model_path=persisted_result.model_output_path,
+            )
+            return response
+        finally:
+            training_lock.release()
 
     @app.get(
         "/health",
@@ -808,22 +963,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            normalized_rows: List[Dict[str, Any]] = []
-            for row in rows:
-                row_payload = row.model_dump()
-                row_payload[TARGET_COLUMN] = str(row_payload[TARGET_COLUMN]).strip().lower()
-
-                if requested_user_id is not None and not row_payload.get("user_id"):
-                    row_payload["user_id"] = requested_user_id
-
-                # Accept legacy percentage-style accuracy and normalize to ratio.
-                accuracy_value = float(row_payload["accuracy"])
-                if 1.0 < accuracy_value <= 100.0:
-                    row_payload["accuracy"] = accuracy_value / 100.0
-
-                normalized_rows.append(row_payload)
-
-            dataframe = pd.DataFrame(normalized_rows)
+            dataframe = normalize_retraining_rows(rows, requested_user_id=requested_user_id)
 
             try:
                 arena_result = training_service.run_algorithm_arena(
@@ -848,23 +988,7 @@ def create_app() -> FastAPI:
                     },
                 )
 
-            evaluations = [
-                TrainEvaluationResponse(
-                    algorithmName=entry.name,
-                    accuracy=entry.accuracy,
-                    f1Score=entry.f1_score,
-                    executionTimeMs=int(round(entry.execution_time_ms)),
-                )
-                for entry in arena_result.leaderboard
-            ]
-            response = TrainOrchestratorResponse(
-                winningAlgorithmName=arena_result.winning_algorithm,
-                macroPrecision=arena_result.macro_precision,
-                macroRecall=arena_result.macro_recall,
-                topPredictiveFeature=arena_result.top_predictive_feature,
-                primaryMisclassification=arena_result.primary_misclassification,
-                evaluations=evaluations,
-            )
+            response = build_train_response(arena_result)
 
             if is_dry_run:
                 logger.info(

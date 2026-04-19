@@ -90,7 +90,7 @@ Response fields:
 
 ### POST `/predict`
 
-Purpose: predict `weakest_finger` for one row, optionally using a personalized user model with global cold-start fallback.
+Purpose: predict `weakest_finger` for one row using a personalized user model when available, with automatic fallback to the global baseline.
 
 Request JSON shape:
 
@@ -143,9 +143,9 @@ Response:
 - `is_fallback_used`: `true` when the global baseline model is used, `false` when a personalized model is used
 
 Cold-start behavior:
-- If `user_id` is provided, the API first attempts to load that user's personalized model artifact.
-- If the personalized artifact is missing, the API catches `FileNotFoundError` and falls back to the configured global baseline model.
-- If `user_id` is omitted, the request is served by the global runtime model and `is_fallback_used` is `true`.
+- If `user_id` is provided, the API first attempts to load `models/model_production_{user_id}.joblib`.
+- If the personalized artifact is missing, the API catches `FileNotFoundError`, logs a warning, and falls back to `models/model_production_global.joblib`.
+- The response includes `is_fallback_used`, which is `true` when the global baseline model was used.
 
 ### POST `/predict_batch`
 
@@ -162,54 +162,42 @@ Request JSON shape:
 }
 ```
 
-### POST `/train`
+### POST `/train/global`
 
-Purpose: run the thesis "Algorithm Arena" retraining pipeline with optional dry-run safety mode.
+Purpose: load the processed dataset from disk, train all candidate algorithms on the full dataset, and save the winner exactly as `models/model_production_global.joblib`.
 
-Preferred request JSON shape:
+Request body:
+
+```json
+{}
+```
+
+Behavior:
+- The API loads the training dataset from disk.
+- No user filtering is applied.
+- The existing algorithm arena still evaluates logistic regression, random forest, and xgboost on the same split policy.
+- The winning model is persisted as `models/model_production_global.joblib`.
+- The response returns the existing evaluation report contract.
+
+### POST `/train/personal`
+
+Purpose: load the processed dataset from disk, filter it to one user, train the personalized model, and save the winner exactly as `models/model_production_{user_id}.joblib`.
+
+Request JSON shape:
 
 ```json
 {
   "user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74",
-  "is_dry_run": true,
-  "rows": [
-    {
-      "wpm": 55,
-      "accuracy": 0.93,
-      "error_left_pinky": 0.02,
-      "error_left_ring": 0.01,
-      "error_left_middle": 0.01,
-      "error_left_index": 0.01,
-      "error_right_index": 0.02,
-      "error_right_middle": 0.01,
-      "error_right_ring": 0.01,
-      "error_right_pinky": 0.01,
-      "dwell_left_pinky": 115,
-      "dwell_left_ring": 98,
-      "dwell_left_middle": 91,
-      "dwell_left_index": 86,
-      "dwell_right_index": 88,
-      "dwell_right_middle": 93,
-      "dwell_right_ring": 99,
-      "dwell_right_pinky": 121,
-      "flight_left_pinky": 220,
-      "flight_left_ring": 198,
-      "flight_left_middle": 180,
-      "flight_left_index": 171,
-      "flight_right_index": 174,
-      "flight_right_middle": 182,
-      "flight_right_ring": 203,
-      "flight_right_pinky": 231,
-      "weakest_finger": "right_pinky"
-    }
-  ]
+  "rows": []
 }
 ```
 
 Behavior:
-- The API normalizes and validates rows, then creates a DataFrame.
-- When `user_id` is provided, the API filters the DataFrame to rows for that user before deduplication and before the 80/20 split.
+- If `rows` is omitted or empty, the API loads the training dataset from disk.
+- If `rows` is present, the API trains from those supplied rows instead of requiring the processed dataset to already contain the requested user.
+- The effective dataset is filtered to the requested `user_id` before deduplication and before the 80/20 split.
 - Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
+- If fewer than 20 rows remain after filtering, the API returns HTTP 400 with `Insufficient data`.
 - The payload is split into 80% training data and 20% testing data using `random_state=42`.
 - Three algorithms are trained on the same training split: logistic regression, random forest, and xgboost.
 - Each candidate reports:
@@ -217,77 +205,8 @@ Behavior:
   - `f1_score` (macro F1)
   - `execution_time_ms`
 - The winner is chosen by highest macro F1-score.
-- After the winner is selected, that winning algorithm is retrained from scratch on 100% of the payload.
-
-Dry-run mode (`is_dry_run=true`, default):
-- Runs the full arena evaluation and full-data winner retraining.
-- Does NOT save artifact to disk.
-- Does NOT hot-reload runtime model state.
-- Returns status:
-
-```json
-{
-  "status": "success_dry_run",
-  "winning_algorithm": "xgboost",
-  "winning_f1_score": 0.91,
-  "total_rows_processed": 150,
-  "leaderboard": [
-    {
-      "name": "logistic_regression",
-      "accuracy": 0.89,
-      "f1_score": 0.87,
-      "execution_time_ms": 12.5
-    },
-    {
-      "name": "random_forest",
-      "accuracy": 0.92,
-      "f1_score": 0.9,
-      "execution_time_ms": 44.8
-    },
-    {
-      "name": "xgboost",
-      "accuracy": 0.94,
-      "f1_score": 0.91,
-      "execution_time_ms": 57.3
-    }
-  ]
-}
-```
-
-Production mode (`is_dry_run=false`):
-- Saves the final full-data winning artifact to a new timestamped per-user path under `models/production/`.
-- Updates the active-model pointer file at `models/active_production_model.json`.
-- Hot-reloads active model in API memory.
-- Returns status:
-
-```json
-{
-  "status": "success_production",
-  "winning_algorithm": "xgboost",
-  "winning_f1_score": 0.91,
-  "total_rows_processed": 150,
-  "leaderboard": [
-    {
-      "name": "logistic_regression",
-      "accuracy": 0.89,
-      "f1_score": 0.87,
-      "execution_time_ms": 12.5
-    },
-    {
-      "name": "random_forest",
-      "accuracy": 0.92,
-      "f1_score": 0.9,
-      "execution_time_ms": 44.8
-    },
-    {
-      "name": "xgboost",
-      "accuracy": 0.94,
-      "f1_score": 0.91,
-      "execution_time_ms": 57.3
-    }
-  ]
-}
-```
+- After the winner is selected, that winning algorithm is retrained from scratch on 100% of the filtered dataset.
+- The winning model is saved as `models/model_production_{user_id}.joblib`.
 
 Compatibility note:
 - Legacy payloads that post only an array of rows are still accepted and treated as dry-run.
