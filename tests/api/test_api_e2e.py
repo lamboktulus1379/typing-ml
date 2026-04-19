@@ -68,6 +68,48 @@ def _build_retraining_rows() -> list[dict[str, float | str]]:
     return rows
 
 
+def _build_dataset_training_rows() -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+
+    for scale in range(12):
+        row = _build_row(float(scale) / 10.0)
+        row["accuracy"] = 0.91 + (0.002 * scale)
+        row["error_left_pinky"] = 0.25 + (0.005 * scale)
+        row["error_right_pinky"] = 0.01
+        row["weakest_finger"] = "left_pinky"
+        row["user_id"] = "user-test-1"
+        rows.append(row)
+
+    for scale in range(12, 24):
+        row = _build_row(float(scale) / 10.0)
+        row["accuracy"] = 0.91 + (0.002 * (scale - 12))
+        row["error_left_pinky"] = 0.01
+        row["error_right_pinky"] = 0.25 + (0.005 * (scale - 12))
+        row["weakest_finger"] = "right_pinky"
+        row["user_id"] = "user-test-1"
+        rows.append(row)
+
+    for scale in range(4):
+        row = _build_row((float(scale) + 0.5) / 10.0)
+        row["accuracy"] = 0.9 + (0.002 * scale)
+        row["error_left_pinky"] = 0.22 + (0.003 * scale)
+        row["error_right_pinky"] = 0.01
+        row["weakest_finger"] = "left_pinky"
+        row["user_id"] = "missing-user"
+        rows.append(row)
+
+    for scale in range(4, 8):
+        row = _build_row((float(scale) + 0.5) / 10.0)
+        row["accuracy"] = 0.9 + (0.002 * (scale - 4))
+        row["error_left_pinky"] = 0.01
+        row["error_right_pinky"] = 0.22 + (0.003 * (scale - 4))
+        row["weakest_finger"] = "right_pinky"
+        row["user_id"] = "missing-user"
+        rows.append(row)
+
+    return rows
+
+
 class EncodedDummyModel:
     """Minimal model stub that emits encoded class indices."""
 
@@ -126,6 +168,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     production_model_dir = tmp_path / "production"
     active_model_metadata_path = tmp_path / "active_production_model.json"
     train_reports_dir = tmp_path / "reports"
+    training_dataset_path = tmp_path / "dataset.csv"
 
     # Minimal training data just to create a valid artifact with predict_proba.
     rows = [_build_row(0.0), _build_row(1.0), _build_row(2.0), _build_row(3.0)]
@@ -148,11 +191,15 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         "created_at": "2026-03-28T00:00:00+00:00",
     }
     joblib.dump(artifact, model_path)
+    pd.DataFrame(_build_dataset_training_rows()).to_csv(training_dataset_path, index=False)
 
     monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(model_path))
     monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
     monkeypatch.setenv("TYPING_ML_ACTIVE_MODEL_METADATA_PATH", str(active_model_metadata_path))
     monkeypatch.setenv("TYPING_ML_TRAIN_REPORTS_DIR", str(train_reports_dir))
+    monkeypatch.setenv("TYPING_ML_TRAINING_DATASET_PATH", str(training_dataset_path))
+    monkeypatch.setenv("TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH", str(tmp_path / "model_production_global.joblib"))
+    monkeypatch.setenv("TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE", str(tmp_path / "model_production_{user_id}.joblib"))
 
     # Ensure import side effects pick up patched environment variable.
     if "src.api" in sys.modules:
@@ -162,6 +209,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app = api_module.create_app()
     app.extra["active_model_metadata_path"] = str(active_model_metadata_path)
     app.extra["train_reports_dir"] = str(train_reports_dir)
+    app.extra["training_dataset_path"] = str(training_dataset_path)
     return TestClient(app)
 
 
@@ -224,8 +272,7 @@ def api_client_predict_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> TestClient:
     global_model_path = tmp_path / "model_production_global.joblib"
-    production_model_dir = tmp_path / "production"
-    personalized_model_path = production_model_dir / "typing-prod-20260419T120000_000000Z-user-test-1-logistic_regression.joblib"
+    personalized_model_path = tmp_path / "model_production_user-test-1.joblib"
 
     global_artifact = {
         "model": GlobalFallbackPredictDummyModel(),
@@ -243,12 +290,11 @@ def api_client_predict_fallback(
     }
 
     joblib.dump(global_artifact, global_model_path)
-    production_model_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(personalized_artifact, personalized_model_path)
 
     monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(global_model_path))
     monkeypatch.setenv("TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH", str(global_model_path))
-    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
+    monkeypatch.setenv("TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE", str(tmp_path / "model_production_{user_id}.joblib"))
 
     if "src.api" in sys.modules:
         del sys.modules["src.api"]
@@ -382,6 +428,92 @@ def test_predict_falls_back_to_global_model_when_personalized_model_is_missing(
     assert body["prediction"] == "global_left"
     assert set(body["probabilities"].keys()) == {"global_left", "global_right"}
     assert body["is_fallback_used"] is True
+
+
+def test_predict_without_user_id_uses_global_model(api_client_predict_fallback: TestClient) -> None:
+    payload = {"row": _build_row(0.5)}
+    res = api_client_predict_fallback.post("/predict", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["prediction"] == "global_left"
+    assert body["is_fallback_used"] is True
+
+
+def test_train_global_saves_fixed_global_model_path(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    response = api_client.post("/train/global", json={})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+    }
+    global_model_path = Path(api_client.app.extra["training_dataset_path"]).parent / "model_production_global.joblib"
+    assert global_model_path.exists()
+
+
+def test_train_personal_saves_fixed_personal_model_path(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    response = api_client.post("/train/personal", json={"userId": "user-test-1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+    }
+    personal_model_path = Path(api_client.app.extra["training_dataset_path"]).parent / "model_production_user-test-1.joblib"
+    assert personal_model_path.exists()
+
+
+def test_train_personal_accepts_inline_rows_for_user_missing_from_dataset(api_client: TestClient) -> None:
+    if importlib.util.find_spec("xgboost") is None:
+        pytest.skip("xgboost is not installed in this environment")
+
+    inline_rows: list[dict[str, float | str]] = []
+    for scale in range(12):
+        row = _build_row(10.0 + float(scale))
+        row["error_left_pinky"] = 0.28 + (0.004 * scale)
+        row["error_right_pinky"] = 0.01
+        row["weakest_finger"] = "left_pinky"
+        inline_rows.append(row)
+
+    for scale in range(12, 24):
+        row = _build_row(10.0 + float(scale))
+        row["error_left_pinky"] = 0.01
+        row["error_right_pinky"] = 0.28 + (0.004 * (scale - 12))
+        row["weakest_finger"] = "right_pinky"
+        inline_rows.append(row)
+
+    response = api_client.post(
+        "/train/personal",
+        json={"userId": "inline-user", "rows": inline_rows},
+    )
+
+    assert response.status_code == 200
+    personal_model_path = Path(api_client.app.extra["training_dataset_path"]).parent / "model_production_inline-user.joblib"
+    assert personal_model_path.exists()
+
+
+def test_train_personal_rejects_insufficient_rows(api_client: TestClient) -> None:
+    response = api_client.post("/train/personal", json={"userId": "missing-user"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Insufficient data"
 
 
 def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) -> None:

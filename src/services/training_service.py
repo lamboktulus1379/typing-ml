@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Sequence
 
@@ -13,6 +14,7 @@ import sklearn.model_selection as sk_model_selection
 from sklearn.preprocessing import LabelEncoder
 
 try:
+    from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
     from src.ml_pipeline.constants import (
         ALLOWED_WEAKEST_FINGER_LABELS,
         FEATURE_RANGE_RULES,
@@ -27,6 +29,7 @@ try:
     from src.ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from src.ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
 except ModuleNotFoundError:
+    from ml_pipeline.artifacts import ArtifactStore, ModelArtifact
     from ml_pipeline.constants import (
         ALLOWED_WEAKEST_FINGER_LABELS,
         FEATURE_RANGE_RULES,
@@ -40,6 +43,12 @@ except ModuleNotFoundError:
     )
     from ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
+
+
+DEFAULT_TRAINING_DATASET_PATH = "data/processed/dataset.csv"
+DEFAULT_GLOBAL_MODEL_PATH = "models/model_production_global.joblib"
+DEFAULT_PERSONAL_MODEL_TEMPLATE = "models/model_production_{user_id}.joblib"
+DEFAULT_MIN_PERSONAL_TRAINING_ROWS = 20
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,15 @@ class AlgorithmArenaResult:
     retrained_label_classes: list[str] | None = None
 
 
+@dataclass(frozen=True)
+class PersistedTrainingResult:
+    """Persisted global or personalized training output."""
+
+    arena_result: AlgorithmArenaResult
+    artifact: ModelArtifact
+    model_output_path: str
+
+
 @dataclass
 class TrainingArenaService:
     """Validates payloads, evaluates candidate algorithms, and retrains the winner."""
@@ -90,6 +108,57 @@ class TrainingArenaService:
             target_validator=TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS),
             random_state=random_state,
         )
+
+    def load_training_dataset(self, data_path: str = DEFAULT_TRAINING_DATASET_PATH) -> pd.DataFrame:
+        """Load the persisted processed dataset used for global or personalized training."""
+
+        dataframe = pd.read_csv(data_path)
+        if dataframe.empty:
+            raise ValueError("Training dataset is empty. Provide at least one row.")
+
+        if TARGET_COLUMN not in dataframe.columns:
+            raise ValueError(
+                f"Training dataset is missing required target column '{TARGET_COLUMN}'."
+            )
+
+        return dataframe
+
+    def train_global_model(
+        self,
+        *,
+        data_path: str = DEFAULT_TRAINING_DATASET_PATH,
+        algorithms: Sequence[str],
+        artifact_store: ArtifactStoreProtocol,
+        model_output_path: str = DEFAULT_GLOBAL_MODEL_PATH,
+    ) -> PersistedTrainingResult:
+        """Load the full dataset, train the global model, and persist the winner."""
+
+        dataframe = self.load_training_dataset(data_path)
+        arena_result = self.run_algorithm_arena(dataframe, algorithms=algorithms)
+        return self._persist_training_result(arena_result, artifact_store=artifact_store, model_output_path=model_output_path)
+
+    def train_personal_model(
+        self,
+        *,
+        user_id: str,
+        data_path: str = DEFAULT_TRAINING_DATASET_PATH,
+        dataframe: pd.DataFrame | None = None,
+        algorithms: Sequence[str],
+        artifact_store: ArtifactStoreProtocol,
+        model_output_path_template: str = DEFAULT_PERSONAL_MODEL_TEMPLATE,
+        minimum_rows: int = DEFAULT_MIN_PERSONAL_TRAINING_ROWS,
+    ) -> PersistedTrainingResult:
+        """Load the dataset, filter to one user, enforce minimum rows, and persist the winner."""
+
+        effective_dataframe = dataframe.copy() if dataframe is not None else self.load_training_dataset(data_path)
+        filtered_dataframe = self._filter_dataframe_for_user(effective_dataframe, user_id=user_id)
+        if len(filtered_dataframe) < minimum_rows:
+            raise ValueError("Insufficient data")
+
+        sanitized_user_id = self._sanitize_user_id_for_path(user_id)
+        arena_result = self.run_algorithm_arena(filtered_dataframe, algorithms=algorithms)
+        model_output_path = model_output_path_template.format(user_id=sanitized_user_id)
+        return self._persist_training_result(arena_result, artifact_store=artifact_store, model_output_path=model_output_path)
 
     def run_algorithm_arena(
         self,
@@ -238,6 +307,34 @@ class TrainingArenaService:
             execution_time_ms=execution_time_ms,
             model=model,
             label_classes=label_classes,
+        )
+
+    @staticmethod
+    def _sanitize_user_id_for_path(user_id: str) -> str:
+        normalized = user_id.strip().lower()
+        sanitized = "".join(character if character.isalnum() or character in {"_", "-"} else "_" for character in normalized)
+        sanitized = sanitized.strip("_")
+        return sanitized or "anonymous"
+
+    @staticmethod
+    def _persist_training_result(
+        arena_result: AlgorithmArenaResult,
+        *,
+        artifact_store: ArtifactStoreProtocol,
+        model_output_path: str,
+    ) -> PersistedTrainingResult:
+        artifact = ModelArtifact.from_training(
+            model=arena_result.retrained_model,
+            model_name=arena_result.winning_algorithm,
+            feature_names=TRAIN_FEATURE_COLUMNS,
+            target_name=TARGET_COLUMN,
+            label_classes=arena_result.retrained_label_classes,
+        )
+        artifact_store.save_model_artifact(artifact, model_output_path)
+        return PersistedTrainingResult(
+            arena_result=arena_result,
+            artifact=artifact,
+            model_output_path=str(Path(model_output_path)),
         )
 
     def _fit_model(

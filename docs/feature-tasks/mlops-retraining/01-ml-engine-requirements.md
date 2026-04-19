@@ -2,22 +2,24 @@
 
 ## Goal
 
-Provide a training worker endpoint that accepts in-memory dataset rows, trains candidate models, selects the best model by F1-score, writes immutable production artifacts, updates an active-model pointer, hot-reloads runtime inference without server restart, and supports per-user personalized training requests without changing the winner/evaluation response contract used by the .NET orchestrator. Also support inference cold-start handling so `/predict` can fall back to a global baseline model when a personalized model does not yet exist for the requested user.
+Provide training worker endpoints that load the persisted dataset, train candidate models, select the best model by F1-score, save a fixed global or personalized production artifact, hot-reload runtime inference without server restart, and support per-user personalized training requests without changing the core winner/evaluation logic. Also support inference cold-start handling so `/predict` can fall back to a global baseline model when a personalized model does not yet exist for the requested user.
 
 ## In Scope
 
-- New endpoint: `POST /train`.
+- New endpoint: `POST /train/global`.
+- New endpoint: `POST /train/personal`.
 - Pydantic validation for retraining payload.
+- Dataset loading from the processed training CSV.
 - Candidate algorithm training for:
   - logistic_regression
   - random_forest
   - xgboost
 - Deterministic winner selection by F1-score.
-- Save winner artifact to a timestamped immutable path under `models/production/`.
+- Save the global winner artifact exactly as `models/model_production_global.joblib`.
+- Save the personalized winner artifact exactly as `models/model_production_{user_id}.joblib`.
 - Personalized retraining request support via top-level `user_id`.
 - Strict per-user dataset filtering before the 80/20 train/test split.
-- Per-user production artifact naming so one user's promoted artifact does not overwrite another's file.
-- Maintain an active-model pointer file at `models/active_production_model.json`.
+- Personalized requests must reject insufficient data when filtered rows are fewer than 20.
 - Hot-reload in-process model used by `/predict` and `/predict_batch`.
 - Cold-start fallback in `POST /predict` for user-specific inference.
 - Predict response metadata flag describing whether global fallback was used.
@@ -56,36 +58,40 @@ Predict operational requirements:
 - If the personalized artifact is missing, inference must catch `FileNotFoundError` and fall back to the configured global baseline model.
 - Predict responses must include `is_fallback_used` so upstream callers can distinguish personalized inference from global fallback inference.
 
-### Request
+### Global Training Request
 
 - Method: `POST`
-- Route: `/train`
-- Payload: object with `user_id`, `is_dry_run`, and array of typing-session feature rows.
+- Route: `/train/global`
+- Payload: empty body.
+
+Operational requirement:
+- The worker must load the full processed dataset from disk.
+- Global training must use all available rows without user filtering.
+- The winning promoted artifact must be written exactly to `models/model_production_global.joblib`.
+
+### Personalized Training Request
+
+- Method: `POST`
+- Route: `/train/personal`
+- Payload: object with `user_id` and optional `rows`.
 
 Minimum row shape:
 
 ```json
 {
   "user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74",
-  "is_dry_run": true,
-  "rows": [
-    {
-      "wpm": 68,
-      "accuracy": 100,
-      "dwell_left_pinky": 100.5,
-      "flight_left_pinky": 223.7,
-      "error_left_pinky": 0,
-      "weakest_finger": "left_pinky"
-    }
-  ]
+  "rows": []
 }
 ```
 
 Operational requirement:
 - Full feature schema used by current model factory should be validated before training starts.
 - The retraining request must include a non-empty `user_id` value for personalized retrain mode.
-- Before deduplication and before the 80/20 split, the worker must reduce the dataset to rows matching the requested `user_id` only.
-- If the filtered dataset is empty, the worker must reject the request.
+- If `rows` is omitted or empty, the worker must load the persisted processed dataset from disk.
+- If `rows` is present, the worker must train from those supplied rows instead of requiring the processed dataset to already contain the requested user.
+- Before deduplication and before the 80/20 split, the worker must reduce the effective dataset to rows matching the requested `user_id` only.
+- If the filtered dataset contains fewer than 20 rows, the worker must reject the request with HTTP 400 and message `Insufficient data`.
+- The winning promoted artifact must be written exactly to `models/model_production_{user_id}.joblib`.
 
 ### Response
 
@@ -107,8 +113,9 @@ Optional extension (recommended for UI evaluation step):
   - Validate required numeric features and target `weakest_finger` via Pydantic and pipeline validators.
 
 - ML-RQ-02 Dataframe preparation:
-  - Convert request payload to Pandas DataFrame.
-  - Normalize top-level `user_id` and apply a strict filter so the DataFrame contains only rows for that user.
+  - Load the persisted training dataset from disk into a Pandas DataFrame.
+  - Permit the personalized route to receive pre-filterable in-memory rows from the Typing API admin workflow.
+  - For personalized training, normalize top-level `user_id` and apply a strict filter so the DataFrame contains only rows for that user.
   - Split into feature frame and target series.
 
 - ML-RQ-03 Standardization:
@@ -128,20 +135,22 @@ Optional extension (recommended for UI evaluation step):
     - If still tied, lexical order of algorithm key for deterministic reproducibility.
 
 - ML-RQ-07 Artifact output:
-  - Save winner as dict-based artifact to a timestamped immutable path such as `models/production/typing-prod-<timestamp>-<user_id>-<algorithm>.joblib`.
-  - Artifact names must never overwrite a previous production retrain artifact.
+  - Save the global winner as dict-based artifact exactly to `models/model_production_global.joblib`.
+  - Save the personalized winner as dict-based artifact exactly to `models/model_production_{user_id}.joblib`.
+  - The saved artifact must preserve the same feature names, target metadata, and label class metadata already used by inference.
 
-- ML-RQ-08 Active pointer metadata:
-  - Persist `models/active_production_model.json` containing the active artifact path, algorithm, and promotion timestamp.
-  - Runtime startup should prefer the active-model pointer when no explicit model path override is configured.
+- ML-RQ-08 Runtime selection semantics:
+  - `POST /predict` must first attempt to load `models/model_production_{user_id}.joblib` when `user_id` is supplied.
+  - If that file does not exist, the API must log a warning and fall back to `models/model_production_global.joblib`.
+  - Runtime startup should continue to support the existing default model selection logic for non-personalized flows.
 
 - ML-RQ-09 Hot reload:
   - Replace active in-memory model/artifact atomically after successful save.
   - `/predict`, `/predict_batch`, and `/metadata` must reflect new model immediately after successful train response.
 
 - ML-RQ-10 Predict personalized model selection:
-  - `POST /predict` must accept optional `user_id`/`userId`.
-  - When `user_id` is provided, inference must attempt to resolve and load the latest personalized model artifact for that user without modifying existing feature validation or prediction logic.
+  - `POST /predict` must accept `user_id`/`userId` plus one keystroke feature row.
+  - When `user_id` is provided, inference must attempt to resolve and load `models/model_production_{user_id}.joblib` for that user without modifying existing feature validation or prediction logic.
 
 - ML-RQ-11 Predict cold-start fallback:
   - Personalized inference loading must wrap the user-specific artifact load in a `try-except FileNotFoundError` block.
@@ -168,31 +177,27 @@ Optional extension (recommended for UI evaluation step):
 
 ## Acceptance Criteria
 
-- ML-AC-01 `POST /train` validates payload and returns winner metrics.
-- ML-AC-02 Winner artifact is written to a timestamped immutable production path and no previous artifact is overwritten.
-- ML-AC-03 Active-model pointer metadata is updated to the newly promoted artifact.
-- ML-AC-04 Inference endpoints use reloaded model without process restart.
-- ML-AC-05 Failed retraining does not replace active model.
-- ML-AC-06 Tie behavior is deterministic and test-covered.
-- ML-AC-07 Personalized retraining requests filter the dataset to the requested `user_id` before the 80/20 split.
-- ML-AC-08 Production artifact filenames include the requested `user_id` while keeping the response schema unchanged.
-- ML-AC-09 `POST /predict` uses a personalized model when a matching user artifact exists.
-- ML-AC-10 `POST /predict` falls back to the global baseline model when the personalized artifact is missing.
-- ML-AC-11 `POST /predict` includes `is_fallback_used` in the response payload.
+- ML-AC-01 `POST /train/global` loads the dataset from disk, trains candidate models, and returns the winner metrics.
+- ML-AC-02 Global training writes the promoted artifact exactly to `models/model_production_global.joblib`.
+- ML-AC-03 `POST /train/personal` filters the dataset to the requested `user_id` before the 80/20 split.
+- ML-AC-04 Personalized training writes the promoted artifact exactly to `models/model_production_{user_id}.joblib`.
+- ML-AC-05 Personalized training rejects requests with fewer than 20 filtered rows using HTTP 400 `Insufficient data`.
+- ML-AC-05a Personalized training accepts inline admin-supplied rows and uses them even when the persisted processed dataset does not already contain that user.
+- ML-AC-06 Inference endpoints use the updated global or personalized model without process restart.
+- ML-AC-07 Tie behavior remains deterministic and test-covered.
+- ML-AC-08 `POST /predict` uses a personalized model when a matching user artifact exists.
+- ML-AC-09 `POST /predict` falls back to the global baseline model when the personalized artifact is missing.
+- ML-AC-10 `POST /predict` includes `is_fallback_used` in the response payload.
 
 ## Implementation Task Breakdown
 
-- ML-T01 Add Pydantic request model for training rows and payload list.
-- ML-T02 Implement trainer orchestration using existing ml_pipeline services.
-- ML-T03 Add concurrent candidate execution and metric aggregation.
-- ML-T04 Add deterministic winner selector.
-- ML-T05 Persist winning artifact to an immutable timestamped production path.
-- ML-T06 Write and read active-model pointer metadata.
-- ML-T07 Implement thread-safe model hot-reload in FastAPI app state.
-- ML-T08 Add `/train` endpoint wiring and response contract.
-- ML-T09 Add tests for happy path, invalid payload, pointer resolution, and hot-reload behavior.
-- ML-T10 Add request-level `user_id` support and pre-split dataset filtering in the FastAPI retraining path.
-- ML-T11 Add per-user production artifact naming and tests proving the response contract is unchanged.
-- ML-T12 Add `user_id` support to the predict request contract and route wiring.
-- ML-T13 Add inference service helpers for personalized model resolution plus global fallback on `FileNotFoundError`.
-- ML-T14 Add predict endpoint tests covering personalized inference, cold-start fallback, and `is_fallback_used`.
+- ML-T01 Add dataset-backed training request models for `/train/global` and `/train/personal`.
+- ML-T02 Implement dataset loading helpers in `src/services/training_service.py`.
+- ML-T03 Reuse existing algorithm arena evaluation and deterministic winner selection for both global and personalized training.
+- ML-T04 Persist the global winner to `models/model_production_global.joblib`.
+- ML-T05 Persist the personalized winner to `models/model_production_{user_id}.joblib`.
+- ML-T06 Keep thread-safe model hot-reload in FastAPI app state.
+- ML-T07 Add `/train/global` and `/train/personal` endpoint wiring and response contracts.
+- ML-T07a Extend `/train/personal` so it can normalize optional inline rows from the Typing API admin workflow.
+- ML-T08 Update `/predict` personalized model resolution to the fixed personalized and global production paths.
+- ML-T09 Add tests for global training, personalized training, insufficient-data rejection, personalized predict, cold-start fallback, and `is_fallback_used`.
