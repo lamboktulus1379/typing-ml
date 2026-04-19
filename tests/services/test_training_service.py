@@ -69,6 +69,10 @@ def test_run_algorithm_arena_returns_leaderboard_and_full_data_model() -> None:
     assert result.winning_algorithm in {"logistic_regression", "random_forest", "xgboost"}
     assert 0.0 <= result.winning_accuracy <= 1.0
     assert 0.0 <= result.winning_f1_score <= 1.0
+    assert 0.0 <= result.macro_precision <= 1.0
+    assert 0.0 <= result.macro_recall <= 1.0
+    assert result.top_predictive_feature in dataframe.columns
+    assert result.primary_misclassification
     assert len(result.leaderboard) == 3
     assert {entry.name for entry in result.leaderboard} == {
         "logistic_regression",

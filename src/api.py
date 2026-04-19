@@ -465,40 +465,24 @@ class RetrainRequest(BaseModel):
     )
 
 
-class TrainMetricsResponse(BaseModel):
-    """Winner metrics preserved for backwards-compatible clients."""
+class TrainEvaluationResponse(BaseModel):
+    """Per-algorithm evaluation payload for the .NET orchestrator."""
 
-    f1_score: float
+    algorithmName: str
     accuracy: float
+    f1Score: float
+    executionTimeMs: int
 
 
-class TrainLeaderboardEntryResponse(BaseModel):
-    """Public leaderboard entry for one evaluated algorithm."""
+class TrainOrchestratorResponse(BaseModel):
+    """Exact retraining response contract expected by the .NET orchestrator."""
 
-    name: str
-    accuracy: float
-    f1_score: float
-    execution_time_ms: float
-
-
-class TrainResponse(BaseModel):
-    """Typed retraining response for the Algorithm Arena flow."""
-
-    status: str
-    winning_algorithm: str
-    winning_f1_score: float
-    total_rows_processed: int
-    leaderboard: List[TrainLeaderboardEntryResponse]
-    algorithm: str
-    accuracy: float
-    f1_score: float
-    rows_processed: int
-    trained_rows: int
-    metrics: TrainMetricsResponse
-    candidates: Dict[str, TrainLeaderboardEntryResponse]
-    model_path: Optional[str] = None
-    active_model_metadata_path: Optional[str] = None
-    report_path: Optional[str] = None
+    winningAlgorithmName: str
+    macroPrecision: float
+    macroRecall: float
+    topPredictiveFeature: str
+    primaryMisclassification: str
+    evaluations: List[TrainEvaluationResponse]
 
 
 def build_train_report_path(status: str) -> str:
@@ -511,31 +495,32 @@ def build_train_report_path(status: str) -> str:
 
 def persist_train_report(
     artifact_store: ArtifactStore,
-    response: TrainResponse,
+    response: TrainOrchestratorResponse,
     *,
+    status: str,
     is_dry_run: bool,
     random_state: int,
+    total_rows_processed: int,
+    model_path: Optional[str] = None,
+    active_model_metadata_path: Optional[str] = None,
 ) -> str:
     """Persist a JSON report artifact for thesis audit and reproducibility."""
 
-    report_path = build_train_report_path(response.status)
+    report_path = build_train_report_path(status)
     report_payload = {
-        "status": response.status,
+        "status": status,
         "is_dry_run": is_dry_run,
         "random_state": random_state,
         "target_column": TARGET_COLUMN,
-        "winning_algorithm": response.winning_algorithm,
-        "winning_f1_score": response.winning_f1_score,
-        "total_rows_processed": response.total_rows_processed,
-        "leaderboard": [entry.model_dump() for entry in response.leaderboard],
-        "metrics": response.metrics.model_dump(),
-        "algorithm": response.algorithm,
-        "accuracy": response.accuracy,
-        "f1_score": response.f1_score,
-        "rows_processed": response.rows_processed,
-        "trained_rows": response.trained_rows,
-        "model_path": response.model_path,
-        "active_model_metadata_path": response.active_model_metadata_path,
+        "winning_algorithm_name": response.winningAlgorithmName,
+        "macro_precision": response.macroPrecision,
+        "macro_recall": response.macroRecall,
+        "top_predictive_feature": response.topPredictiveFeature,
+        "primary_misclassification": response.primaryMisclassification,
+        "total_rows_processed": total_rows_processed,
+        "evaluations": [entry.model_dump() for entry in response.evaluations],
+        "model_path": model_path,
+        "active_model_metadata_path": active_model_metadata_path,
         "report_created_at": datetime.now(timezone.utc).isoformat(),
     }
     artifact_store.save_report(report_payload, report_path)
@@ -692,11 +677,11 @@ def create_app() -> FastAPI:
             "select the winner by macro F1-score on a deterministic 80/20 split, retrain the winner "
             "on 100% of the dataset, and optionally persist the production artifact."
         ),
-        response_model=TrainResponse,
+        response_model=TrainOrchestratorResponse,
     )
     def train(
         payload: RetrainRequest | List[TypingSessionTrainingData],
-    ) -> TrainResponse:  # pyright: ignore[reportUnusedFunction]
+    ) -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
         """Run one retraining cycle and optionally replace runtime inference model."""
 
         if isinstance(payload, list):
@@ -752,19 +737,22 @@ def create_app() -> FastAPI:
                     },
                 )
 
-            leaderboard = [
-                TrainLeaderboardEntryResponse(
-                    name=entry.name,
+            evaluations = [
+                TrainEvaluationResponse(
+                    algorithmName=entry.name,
                     accuracy=entry.accuracy,
-                    f1_score=entry.f1_score,
-                    execution_time_ms=entry.execution_time_ms,
+                    f1Score=entry.f1_score,
+                    executionTimeMs=int(round(entry.execution_time_ms)),
                 )
                 for entry in arena_result.leaderboard
             ]
-            candidates_payload = {entry.name: entry for entry in leaderboard}
-            metrics = TrainMetricsResponse(
-                f1_score=arena_result.winning_f1_score,
-                accuracy=arena_result.winning_accuracy,
+            response = TrainOrchestratorResponse(
+                winningAlgorithmName=arena_result.winning_algorithm,
+                macroPrecision=arena_result.macro_precision,
+                macroRecall=arena_result.macro_recall,
+                topPredictiveFeature=arena_result.top_predictive_feature,
+                primaryMisclassification=arena_result.primary_misclassification,
+                evaluations=evaluations,
             )
 
             if is_dry_run:
@@ -775,28 +763,15 @@ def create_app() -> FastAPI:
                     arena_result.winning_accuracy,
                     arena_result.winning_f1_score,
                 )
-
-                response = TrainResponse(
-                    status="success_dry_run",
-                    winning_algorithm=arena_result.winning_algorithm,
-                    winning_f1_score=arena_result.winning_f1_score,
-                    total_rows_processed=arena_result.total_rows_processed,
-                    leaderboard=leaderboard,
-                    algorithm=arena_result.winning_algorithm,
-                    accuracy=arena_result.winning_accuracy,
-                    f1_score=arena_result.winning_f1_score,
-                    rows_processed=arena_result.total_rows_processed,
-                    trained_rows=arena_result.total_rows_processed,
-                    metrics=metrics,
-                    candidates=candidates_payload,
-                )
-                report_path = persist_train_report(
+                persist_train_report(
                     artifact_store,
                     response,
+                    status="success_dry_run",
                     is_dry_run=True,
                     random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+                    total_rows_processed=arena_result.total_rows_processed,
                 )
-                return response.model_copy(update={"report_path": report_path})
+                return response
 
             winner_artifact = ModelArtifact.from_training(
                 model=arena_result.retrained_model,
@@ -838,29 +813,17 @@ def create_app() -> FastAPI:
                 active_model_metadata_path,
             )
 
-            response = TrainResponse(
+            persist_train_report(
+                artifact_store,
+                response,
                 status="success_production",
-                winning_algorithm=arena_result.winning_algorithm,
-                winning_f1_score=arena_result.winning_f1_score,
+                is_dry_run=False,
+                random_state=DEFAULT_RETRAIN_RANDOM_STATE,
                 total_rows_processed=arena_result.total_rows_processed,
-                leaderboard=leaderboard,
-                algorithm=arena_result.winning_algorithm,
-                accuracy=arena_result.winning_accuracy,
-                f1_score=arena_result.winning_f1_score,
-                rows_processed=arena_result.total_rows_processed,
-                trained_rows=arena_result.total_rows_processed,
-                metrics=metrics,
-                candidates=candidates_payload,
                 model_path=production_model_path,
                 active_model_metadata_path=active_model_metadata_path,
             )
-            report_path = persist_train_report(
-                artifact_store,
-                response,
-                is_dry_run=False,
-                random_state=DEFAULT_RETRAIN_RANDOM_STATE,
-            )
-            return response.model_copy(update={"report_path": report_path})
+            return response
         finally:
             training_lock.release()
 

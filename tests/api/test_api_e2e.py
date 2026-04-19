@@ -99,6 +99,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     model_path = tmp_path / "model.joblib"
     production_model_dir = tmp_path / "production"
     active_model_metadata_path = tmp_path / "active_production_model.json"
+    train_reports_dir = tmp_path / "reports"
 
     # Minimal training data just to create a valid artifact with predict_proba.
     rows = [_build_row(0.0), _build_row(1.0), _build_row(2.0), _build_row(3.0)]
@@ -125,6 +126,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(model_path))
     monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
     monkeypatch.setenv("TYPING_ML_ACTIVE_MODEL_METADATA_PATH", str(active_model_metadata_path))
+    monkeypatch.setenv("TYPING_ML_TRAIN_REPORTS_DIR", str(train_reports_dir))
 
     # Ensure import side effects pick up patched environment variable.
     if "src.api" in sys.modules:
@@ -132,6 +134,8 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     api_module = importlib.import_module("src.api")
 
     app = api_module.create_app()
+    app.extra["active_model_metadata_path"] = str(active_model_metadata_path)
+    app.extra["train_reports_dir"] = str(train_reports_dir)
     return TestClient(app)
 
 
@@ -301,48 +305,54 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
 
     assert retrain_response.status_code == 200
     body = retrain_response.json()
-    assert body["status"] == "success_production"
-    assert body["winning_algorithm"] in {"logistic_regression", "random_forest", "xgboost"}
-    assert 0.0 <= body["winning_f1_score"] <= 1.0
-    assert body["total_rows_processed"] == len(retrain_payload)
-    assert body["algorithm"] == body["winning_algorithm"]
-    assert body["rows_processed"] == body["total_rows_processed"]
-    assert body["trained_rows"] == body["total_rows_processed"]
-    assert body["model_path"].endswith(".joblib")
-    assert "typing-prod-" in body["model_path"]
-    assert Path(body["model_path"]).exists()
-    assert body["active_model_metadata_path"].endswith("active_production_model.json")
-    assert Path(body["active_model_metadata_path"]).exists()
-    assert body["report_path"].endswith(".json")
-    assert Path(body["report_path"]).exists()
-    assert len(body["leaderboard"]) == 3
-    assert {entry["name"] for entry in body["leaderboard"]} == {
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+    }
+    assert body["winningAlgorithmName"] in {"logistic_regression", "random_forest", "xgboost"}
+    assert 0.0 <= body["macroPrecision"] <= 1.0
+    assert 0.0 <= body["macroRecall"] <= 1.0
+    assert body["topPredictiveFeature"] in FEATURE_NAMES
+    assert body["primaryMisclassification"]
+    assert len(body["evaluations"]) == 3
+    assert {entry["algorithmName"] for entry in body["evaluations"]} == {
         "logistic_regression",
         "random_forest",
         "xgboost",
     }
-    assert set(body["candidates"].keys()) == {
-        "logistic_regression",
-        "random_forest",
-        "xgboost",
-    }
-    for entry in body["leaderboard"]:
+    for entry in body["evaluations"]:
+        assert set(entry.keys()) == {"algorithmName", "accuracy", "f1Score", "executionTimeMs"}
         assert 0.0 <= entry["accuracy"] <= 1.0
-        assert 0.0 <= entry["f1_score"] <= 1.0
-        assert entry["execution_time_ms"] >= 0.0
+        assert 0.0 <= entry["f1Score"] <= 1.0
+        assert isinstance(entry["executionTimeMs"], int)
+        assert entry["executionTimeMs"] >= 0
+
+    pointer_path = Path(api_client.app.extra["active_model_metadata_path"])
+    assert pointer_path.exists()
+    pointer_payload = __import__("json").loads(pointer_path.read_text(encoding="utf-8"))
+    assert pointer_payload["model_algorithm"] == body["winningAlgorithmName"]
+    assert pointer_payload["model_path"].endswith(".joblib")
+    assert "typing-prod-" in pointer_payload["model_path"]
+    assert Path(pointer_payload["model_path"]).exists()
+
+    report_dir = Path(api_client.app.extra["train_reports_dir"])
+    report_files = sorted(report_dir.glob("train_success_production_*.json"))
+    assert report_files
+    report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
+    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
+    assert report_payload["total_rows_processed"] == len(retrain_payload)
+    assert len(report_payload["evaluations"]) == 3
 
     metadata_response = api_client.get("/metadata")
     assert metadata_response.status_code == 200
     metadata_body = metadata_response.json()
-    assert metadata_body["model_algorithm"] == body["winning_algorithm"]
-    assert metadata_body["model_path"] == body["model_path"]
-    assert metadata_body["active_model_metadata_path"] == body["active_model_metadata_path"]
-
-    pointer_payload = __import__("json").loads(
-        Path(body["active_model_metadata_path"]).read_text(encoding="utf-8")
-    )
-    assert pointer_payload["model_path"] == body["model_path"]
-    assert pointer_payload["model_algorithm"] == body["winning_algorithm"]
+    assert metadata_body["model_algorithm"] == body["winningAlgorithmName"]
+    assert metadata_body["model_path"] == pointer_payload["model_path"]
+    assert metadata_body["active_model_metadata_path"] == str(pointer_path)
 
     predict_response = api_client.post("/predict", json={"row": _build_row(2.0)})
     assert predict_response.status_code == 200
@@ -363,20 +373,29 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "success_dry_run"
-    assert body["total_rows_processed"] == len(unique_rows)
-    assert body["rows_processed"] == len(unique_rows)
-    assert body["total_rows_processed"] < len(duplicated_rows)
-    assert body["report_path"].endswith(".json")
-    assert Path(body["report_path"]).exists()
-    assert len(body["leaderboard"]) == 3
-    assert set(body["candidates"].keys()) == {
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+    }
+    assert len(body["evaluations"]) == 3
+    assert {entry["algorithmName"] for entry in body["evaluations"]} == {
         "logistic_regression",
         "random_forest",
         "xgboost",
     }
-    assert body["algorithm"] == body["winning_algorithm"]
-    assert body["f1_score"] == body["winning_f1_score"]
+
+    report_dir = Path(api_client.app.extra["train_reports_dir"])
+    report_files = sorted(report_dir.glob("train_success_dry_run_*.json"))
+    assert report_files
+    report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
+    assert report_payload["total_rows_processed"] == len(unique_rows)
+    assert report_payload["total_rows_processed"] < len(duplicated_rows)
+    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
+    assert len(report_payload["evaluations"]) == 3
 
 
 def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
@@ -391,14 +410,17 @@ def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    report_path = Path(body["report_path"])
-    report_payload = __import__("json").loads(report_path.read_text(encoding="utf-8"))
+    report_dir = Path(api_client.app.extra["train_reports_dir"])
+    report_files = sorted(report_dir.glob("train_success_dry_run_*.json"))
+    assert report_files
+    report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
 
     assert report_payload["status"] == "success_dry_run"
     assert report_payload["is_dry_run"] is True
-    assert report_payload["winning_algorithm"] == body["winning_algorithm"]
-    assert report_payload["total_rows_processed"] == body["total_rows_processed"]
-    assert len(report_payload["leaderboard"]) == 3
+    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
+    assert len(report_payload["evaluations"]) == 3
+    assert 0.0 <= report_payload["macro_precision"] <= 1.0
+    assert 0.0 <= report_payload["macro_recall"] <= 1.0
 
 
 def test_train_rejects_empty_rows(api_client: TestClient) -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 import sklearn.metrics as sk_metrics
 import sklearn.model_selection as sk_model_selection
@@ -60,6 +61,10 @@ class AlgorithmArenaResult:
     winning_algorithm: str
     winning_accuracy: float
     winning_f1_score: float
+    macro_precision: float
+    macro_recall: float
+    top_predictive_feature: str
+    primary_misclassification: str
     total_rows_processed: int
     leaderboard: tuple[AlgorithmLeaderboardEntry, ...]
     retrained_model: Any
@@ -146,6 +151,15 @@ class TrainingArenaService:
             for algorithm in algorithms
         )
         winner = self._choose_winner(leaderboard)
+        winner_predictions = self._predict_with_optional_decoder(winner.model, x_test, winner.label_classes)
+        macro_precision = float(
+            sk_metrics.precision_score(y_test, winner_predictions, average="macro", zero_division=0)
+        )
+        macro_recall = float(
+            sk_metrics.recall_score(y_test, winner_predictions, average="macro", zero_division=0)
+        )
+        top_predictive_feature = self._extract_top_predictive_feature(winner.model, list(x_train.columns))
+        primary_misclassification = self._build_primary_misclassification(y_test, winner_predictions)
 
         retrained_model, retrained_label_classes, _ = self._fit_model(
             winner.name,
@@ -158,6 +172,10 @@ class TrainingArenaService:
             winning_algorithm=winner.name,
             winning_accuracy=winner.accuracy,
             winning_f1_score=winner.f1_score,
+            macro_precision=macro_precision,
+            macro_recall=macro_recall,
+            top_predictive_feature=top_predictive_feature,
+            primary_misclassification=primary_misclassification,
             total_rows_processed=int(len(normalized_dataframe)),
             leaderboard=leaderboard,
             retrained_model=retrained_model,
@@ -244,3 +262,51 @@ class TrainingArenaService:
             key=lambda entry: (-entry.f1_score, -entry.accuracy, entry.name),
         )
         return ranked[0]
+
+    @staticmethod
+    def _extract_top_predictive_feature(model: Any, feature_names: list[str]) -> str:
+        estimator = getattr(model, "named_steps", {}).get("clf", model)
+
+        importance_scores = getattr(estimator, "feature_importances_", None)
+        if importance_scores is None:
+            coefficients = getattr(estimator, "coef_", None)
+            if coefficients is not None:
+                importance_scores = np.abs(np.asarray(coefficients, dtype=float))
+                if importance_scores.ndim > 1:
+                    importance_scores = importance_scores.mean(axis=0)
+
+        if importance_scores is None:
+            return feature_names[0] if feature_names else "unknown_feature"
+
+        flattened_scores = np.asarray(importance_scores, dtype=float).reshape(-1)
+        if flattened_scores.size == 0:
+            return feature_names[0] if feature_names else "unknown_feature"
+
+        feature_index = int(np.argmax(flattened_scores))
+        if 0 <= feature_index < len(feature_names):
+            return feature_names[feature_index]
+
+        return feature_names[0] if feature_names else "unknown_feature"
+
+    @staticmethod
+    def _build_primary_misclassification(y_true: pd.Series, predictions: Any) -> str:
+        y_true_values = [str(value) for value in y_true.tolist()]
+        prediction_values = [str(value) for value in pd.Series(predictions).tolist()]
+        labels = sorted(set(y_true_values) | set(prediction_values))
+
+        if not labels:
+            return "No primary misclassification detected on holdout data"
+
+        confusion = sk_metrics.confusion_matrix(y_true_values, prediction_values, labels=labels)
+        off_diagonal = confusion.copy()
+        np.fill_diagonal(off_diagonal, 0)
+
+        largest_error = int(off_diagonal.max()) if off_diagonal.size else 0
+        if largest_error <= 0:
+            return "No primary misclassification detected on holdout data"
+
+        true_index, predicted_index = np.argwhere(off_diagonal == largest_error)[0]
+        return (
+            f"True class {labels[int(true_index)]} was frequently misclassified as "
+            f"{labels[int(predicted_index)]}"
+        )
