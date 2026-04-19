@@ -90,12 +90,13 @@ Response fields:
 
 ### POST `/predict`
 
-Purpose: predict `weakest_finger` for one row.
+Purpose: predict `weakest_finger` for one row, optionally using a personalized user model with global cold-start fallback.
 
 Request JSON shape:
 
 ```json
 {
+  "user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74",
   "row": {
     "wpm": 55,
     "accuracy": 0.93,
@@ -132,13 +133,19 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8000/predict \
   -H 'Content-Type: application/json' \
-  -d '{"row": {"wpm": 55, "accuracy": 0.93, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01, "dwell_left_pinky": 115, "dwell_left_ring": 98, "dwell_left_middle": 91, "dwell_left_index": 86, "dwell_right_index": 88, "dwell_right_middle": 93, "dwell_right_ring": 99, "dwell_right_pinky": 121, "flight_left_pinky": 220, "flight_left_ring": 198, "flight_left_middle": 180, "flight_left_index": 171, "flight_right_index": 174, "flight_right_middle": 182, "flight_right_ring": 203, "flight_right_pinky": 231}}' \
+  -d '{"user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74", "row": {"wpm": 55, "accuracy": 0.93, "error_left_pinky": 0.02, "error_left_ring": 0.01, "error_left_middle": 0.01, "error_left_index": 0.01, "error_right_index": 0.02, "error_right_middle": 0.01, "error_right_ring": 0.01, "error_right_pinky": 0.01, "dwell_left_pinky": 115, "dwell_left_ring": 98, "dwell_left_middle": 91, "dwell_left_index": 86, "dwell_right_index": 88, "dwell_right_middle": 93, "dwell_right_ring": 99, "dwell_right_pinky": 121, "flight_left_pinky": 220, "flight_left_ring": 198, "flight_left_middle": 180, "flight_left_index": 171, "flight_right_index": 174, "flight_right_middle": 182, "flight_right_ring": 203, "flight_right_pinky": 231}}' \
   | python -m json.tool
 ```
 
 Response:
 - `prediction`: predicted label
 - `probabilities` (optional): probability per class (if the model supports `predict_proba`)
+- `is_fallback_used`: `true` when the global baseline model is used, `false` when a personalized model is used
+
+Cold-start behavior:
+- If `user_id` is provided, the API first attempts to load that user's personalized model artifact.
+- If the personalized artifact is missing, the API catches `FileNotFoundError` and falls back to the configured global baseline model.
+- If `user_id` is omitted, the request is served by the global runtime model and `is_fallback_used` is `true`.
 
 ### POST `/predict_batch`
 

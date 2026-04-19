@@ -227,6 +227,44 @@ def resolve_runtime_model_selection(
     return model_path, selected_algorithm, None
 
 
+def resolve_global_fallback_model_path() -> str:
+    """Return the global baseline model path used for cold-start fallback."""
+
+    return os.getenv(
+        "TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH",
+        os.getenv("TYPING_ML_PRODUCTION_MODEL_PATH", DEFAULT_PRODUCTION_MODEL_PATH),
+    )
+
+
+def resolve_personalized_model_path(user_id: str) -> str:
+    """Resolve the preferred personalized model path for one user.
+
+    Preference order:
+    1. Explicit template override via environment variable
+    2. Latest immutable production artifact matching the sanitized user id
+    3. Legacy fixed per-user production artifact path
+    """
+
+    sanitized_user_id = _sanitize_user_id_for_path(user_id)
+    explicit_template = os.getenv("TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE")
+    if explicit_template:
+        return explicit_template.format(user_id=sanitized_user_id)
+
+    production_dir = os.getenv("TYPING_ML_PRODUCTION_MODEL_DIR", DEFAULT_PRODUCTION_MODEL_DIR)
+    if os.path.isdir(production_dir):
+        matched_artifacts = sorted(
+            os.path.join(production_dir, file_name)
+            for file_name in os.listdir(production_dir)
+            if file_name.endswith(".joblib")
+            and file_name.startswith("typing-prod-")
+            and f"-{sanitized_user_id}-" in file_name
+        )
+        if matched_artifacts:
+            return matched_artifacts[-1]
+
+    return os.path.join("models", f"model_production_{sanitized_user_id}.joblib")
+
+
 def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS) -> str:
     """Convert payload to text and cap it to avoid oversized trace attributes."""
 
@@ -451,6 +489,12 @@ class TypingSessionData(BaseModel):
 class PredictRequest(BaseModel):
     """Single-row prediction request payload."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
     row: TypingSessionData
 
 class PredictBatchRequest(BaseModel):
@@ -659,6 +703,42 @@ def create_app() -> FastAPI:
         nonlocal runtime_state
         with runtime_lock:
             runtime_state = new_state
+
+    def load_inference_service_for_model_path(model_path: str) -> tuple[InferenceService, Any]:
+        """Load one inference service instance from the requested artifact path."""
+
+        model, artifact = artifact_store.load_model_artifact(model_path)
+        service = InferenceService(
+            model,
+            artifact,
+            model_path,
+            cast(Optional[str], artifact.get("model_name")),
+        )
+        return service, model
+
+    def resolve_predict_runtime(user_id: Optional[str]) -> tuple[InferenceService, Any, bool]:
+        """Resolve personalized inference first, then fall back to the global baseline."""
+
+        runtime_snapshot = get_runtime_snapshot()
+        if not user_id or not user_id.strip():
+            return runtime_snapshot.inference_service, runtime_snapshot.model, False
+
+        normalized_user_id = user_id.strip()
+        personalized_model_path = resolve_personalized_model_path(normalized_user_id)
+
+        try:
+            personalized_service, personalized_model = load_inference_service_for_model_path(personalized_model_path)
+            return personalized_service, personalized_model, False
+        except FileNotFoundError:
+            global_model_path = resolve_global_fallback_model_path()
+            logger.info(
+                "Personalized model not found for user_id=%s at path=%s. Falling back to global model path=%s",
+                normalized_user_id,
+                personalized_model_path,
+                global_model_path,
+            )
+            global_service, global_model = load_inference_service_for_model_path(global_model_path)
+            return global_service, global_model, True
 
     @app.get(
         "/health",
@@ -872,14 +952,14 @@ def create_app() -> FastAPI:
     def predict(req: PredictRequest) -> Dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Predict weakest finger for a single input row."""
 
-        runtime_snapshot = get_runtime_snapshot()
-        current_service = runtime_snapshot.inference_service
-        current_model = runtime_snapshot.model
+        requested_user_id = req.user_id.strip() if req.user_id else None
+        current_service, current_model, is_fallback_used = resolve_predict_runtime(requested_user_id)
         row_payload = req.row.model_dump()
         feature_count = len(row_payload)
 
         with start_model_inference_span("typing-ml.model.predict", row_count=1, feature_count=feature_count) as span:
             result = current_service.predict_one(row_payload)
+            result["is_fallback_used"] = is_fallback_used
             has_predict_proba = "probabilities" in result
             pred = result.get("prediction")
 
@@ -887,6 +967,9 @@ def create_app() -> FastAPI:
                 span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.has_predict_proba", has_predict_proba)
                 span.set_attribute("typing.ml.model.prediction", str(pred))
+                span.set_attribute("typing.ml.model.is_fallback_used", is_fallback_used)
+                if requested_user_id:
+                    span.set_attribute("typing.ml.model.user_id", requested_user_id)
 
             return result
 

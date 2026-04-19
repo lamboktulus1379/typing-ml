@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a training worker endpoint that accepts in-memory dataset rows, trains candidate models, selects the best model by F1-score, writes immutable production artifacts, updates an active-model pointer, hot-reloads runtime inference without server restart, and supports per-user personalized training requests without changing the winner/evaluation response contract used by the .NET orchestrator.
+Provide a training worker endpoint that accepts in-memory dataset rows, trains candidate models, selects the best model by F1-score, writes immutable production artifacts, updates an active-model pointer, hot-reloads runtime inference without server restart, and supports per-user personalized training requests without changing the winner/evaluation response contract used by the .NET orchestrator. Also support inference cold-start handling so `/predict` can fall back to a global baseline model when a personalized model does not yet exist for the requested user.
 
 ## In Scope
 
@@ -19,6 +19,8 @@ Provide a training worker endpoint that accepts in-memory dataset rows, trains c
 - Per-user production artifact naming so one user's promoted artifact does not overwrite another's file.
 - Maintain an active-model pointer file at `models/active_production_model.json`.
 - Hot-reload in-process model used by `/predict` and `/predict_batch`.
+- Cold-start fallback in `POST /predict` for user-specific inference.
+- Predict response metadata flag describing whether global fallback was used.
 
 ## Out of Scope
 
@@ -27,6 +29,32 @@ Provide a training worker endpoint that accepts in-memory dataset rows, trains c
 - Frontend wizard behavior.
 
 ## Endpoint Contract
+
+### Predict Inference Request
+
+- Method: `POST`
+- Route: `/predict`
+- Payload: object with one `row` and optional `user_id`.
+
+Example shape:
+
+```json
+{
+  "user_id": "9f55a4ee-7be6-4c54-a5c6-bf173ea2ad74",
+  "row": {
+    "wpm": 68,
+    "accuracy": 1.0,
+    "dwell_left_pinky": 100.5,
+    "flight_left_pinky": 223.7,
+    "error_left_pinky": 0.0
+  }
+}
+```
+
+Predict operational requirements:
+- If `user_id` is present, inference must first attempt to load that user's personalized production artifact.
+- If the personalized artifact is missing, inference must catch `FileNotFoundError` and fall back to the configured global baseline model.
+- Predict responses must include `is_fallback_used` so upstream callers can distinguish personalized inference from global fallback inference.
 
 ### Request
 
@@ -111,6 +139,18 @@ Optional extension (recommended for UI evaluation step):
   - Replace active in-memory model/artifact atomically after successful save.
   - `/predict`, `/predict_batch`, and `/metadata` must reflect new model immediately after successful train response.
 
+- ML-RQ-10 Predict personalized model selection:
+  - `POST /predict` must accept optional `user_id`/`userId`.
+  - When `user_id` is provided, inference must attempt to resolve and load the latest personalized model artifact for that user without modifying existing feature validation or prediction logic.
+
+- ML-RQ-11 Predict cold-start fallback:
+  - Personalized inference loading must wrap the user-specific artifact load in a `try-except FileNotFoundError` block.
+  - On `FileNotFoundError`, inference must load the configured global baseline model instead of failing the request.
+
+- ML-RQ-12 Predict response metadata:
+  - `POST /predict` responses must include `is_fallback_used: bool`.
+  - `is_fallback_used` is `false` when a personalized model is used and `true` when the global baseline model is used.
+
 ## Runtime Safety Requirements
 
 - ML-NQ-01 Concurrency safety:
@@ -136,6 +176,9 @@ Optional extension (recommended for UI evaluation step):
 - ML-AC-06 Tie behavior is deterministic and test-covered.
 - ML-AC-07 Personalized retraining requests filter the dataset to the requested `user_id` before the 80/20 split.
 - ML-AC-08 Production artifact filenames include the requested `user_id` while keeping the response schema unchanged.
+- ML-AC-09 `POST /predict` uses a personalized model when a matching user artifact exists.
+- ML-AC-10 `POST /predict` falls back to the global baseline model when the personalized artifact is missing.
+- ML-AC-11 `POST /predict` includes `is_fallback_used` in the response payload.
 
 ## Implementation Task Breakdown
 
@@ -150,3 +193,6 @@ Optional extension (recommended for UI evaluation step):
 - ML-T09 Add tests for happy path, invalid payload, pointer resolution, and hot-reload behavior.
 - ML-T10 Add request-level `user_id` support and pre-split dataset filtering in the FastAPI retraining path.
 - ML-T11 Add per-user production artifact naming and tests proving the response contract is unchanged.
+- ML-T12 Add `user_id` support to the predict request contract and route wiring.
+- ML-T13 Add inference service helpers for personalized model resolution plus global fallback on `FileNotFoundError`.
+- ML-T14 Add predict endpoint tests covering personalized inference, cold-start fallback, and `is_fallback_used`.

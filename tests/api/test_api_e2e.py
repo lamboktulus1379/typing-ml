@@ -94,6 +94,32 @@ class AlgorithmSwitchDummyModel:
         return [[0.8, 0.2] for _ in range(len(frame))]
 
 
+class PersonalizedPredictDummyModel:
+    """Model stub that identifies a personalized inference artifact."""
+
+    def __init__(self) -> None:
+        self.classes_ = ["personalized_left", "personalized_right"]
+
+    def predict(self, frame: pd.DataFrame) -> list[str]:
+        return ["personalized_right" for _ in range(len(frame))]
+
+    def predict_proba(self, frame: pd.DataFrame) -> list[list[float]]:
+        return [[0.05, 0.95] for _ in range(len(frame))]
+
+
+class GlobalFallbackPredictDummyModel:
+    """Model stub that identifies the global cold-start fallback artifact."""
+
+    def __init__(self) -> None:
+        self.classes_ = ["global_left", "global_right"]
+
+    def predict(self, frame: pd.DataFrame) -> list[str]:
+        return ["global_left" for _ in range(len(frame))]
+
+    def predict_proba(self, frame: pd.DataFrame) -> list[list[float]]:
+        return [[0.9, 0.1] for _ in range(len(frame))]
+
+
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     model_path = tmp_path / "model.joblib"
@@ -184,6 +210,45 @@ def api_client_algorithm_switch(
     monkeypatch.delenv("TYPING_ML_MODEL_PATH", raising=False)
     monkeypatch.setenv("TYPING_ML_MODEL_ALGORITHM", "random_forest")
     monkeypatch.setenv("TYPING_ML_MODEL_PATH_RANDOM_FOREST", str(model_path))
+
+    if "src.api" in sys.modules:
+        del sys.modules["src.api"]
+    api_module = importlib.import_module("src.api")
+
+    app = api_module.create_app()
+    return TestClient(app)
+
+
+@pytest.fixture
+def api_client_predict_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> TestClient:
+    global_model_path = tmp_path / "model_production_global.joblib"
+    production_model_dir = tmp_path / "production"
+    personalized_model_path = production_model_dir / "typing-prod-20260419T120000_000000Z-user-test-1-logistic_regression.joblib"
+
+    global_artifact = {
+        "model": GlobalFallbackPredictDummyModel(),
+        "model_name": "global_baseline",
+        "feature_names": FEATURE_NAMES,
+        "target_name": "weakest_finger",
+        "created_at": "2026-04-19T00:00:00+00:00",
+    }
+    personalized_artifact = {
+        "model": PersonalizedPredictDummyModel(),
+        "model_name": "logistic_regression",
+        "feature_names": FEATURE_NAMES,
+        "target_name": "weakest_finger",
+        "created_at": "2026-04-19T00:10:00+00:00",
+    }
+
+    joblib.dump(global_artifact, global_model_path)
+    production_model_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(personalized_artifact, personalized_model_path)
+
+    monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(global_model_path))
+    monkeypatch.setenv("TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH", str(global_model_path))
+    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
 
     if "src.api" in sys.modules:
         del sys.modules["src.api"]
@@ -291,6 +356,32 @@ def test_predict_uses_algorithm_switch_model(
     body = res.json()
     assert body["prediction"] == "rf_class_a"
     assert set(body["probabilities"].keys()) == {"rf_class_a", "rf_class_b"}
+
+
+def test_predict_uses_personalized_model_when_available(
+    api_client_predict_fallback: TestClient,
+) -> None:
+    payload = {"userId": "user-test-1", "row": _build_row(0.5)}
+    res = api_client_predict_fallback.post("/predict", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["prediction"] == "personalized_right"
+    assert set(body["probabilities"].keys()) == {"personalized_left", "personalized_right"}
+    assert body["is_fallback_used"] is False
+
+
+def test_predict_falls_back_to_global_model_when_personalized_model_is_missing(
+    api_client_predict_fallback: TestClient,
+) -> None:
+    payload = {"userId": "missing-user", "row": _build_row(0.5)}
+    res = api_client_predict_fallback.post("/predict", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["prediction"] == "global_left"
+    assert set(body["probabilities"].keys()) == {"global_left", "global_right"}
+    assert body["is_fallback_used"] is True
 
 
 def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) -> None:
