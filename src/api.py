@@ -58,6 +58,8 @@ logger = logging.getLogger("typing-ml")
 
 DEFAULT_MODEL_PATH = "models/model.joblib"
 DEFAULT_PRODUCTION_MODEL_PATH = "models/model_production.joblib"
+DEFAULT_PRODUCTION_MODEL_DIR = "models/production"
+DEFAULT_ACTIVE_MODEL_METADATA_PATH = "models/active_production_model.json"
 DEFAULT_TRAIN_REPORTS_DIR = "reports/retrain_runs"
 DEFAULT_RETRAIN_RANDOM_STATE = int(os.getenv("TYPING_ML_RETRAIN_RANDOM_STATE", "42"))
 DEFAULT_RETRAIN_ALGORITHMS: tuple[str, ...] = (
@@ -78,6 +80,50 @@ class RuntimeInferenceState:
 
     inference_service: "InferenceService"
     model: Any
+
+
+def resolve_active_model_metadata_path() -> str:
+    """Return the metadata pointer path for the active promoted model."""
+
+    return os.getenv(
+        "TYPING_ML_ACTIVE_MODEL_METADATA_PATH",
+        DEFAULT_ACTIVE_MODEL_METADATA_PATH,
+    )
+
+
+def build_production_model_artifact_path(algorithm: str) -> str:
+    """Create a unique immutable artifact path for one promoted production model."""
+
+    models_dir = os.getenv("TYPING_ML_PRODUCTION_MODEL_DIR", DEFAULT_PRODUCTION_MODEL_DIR)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    normalized_algorithm = algorithm.strip().lower()
+    return os.path.join(models_dir, f"typing-prod-{timestamp}-{normalized_algorithm}.joblib")
+
+
+def load_active_model_pointer(artifact_store: ArtifactStore) -> Optional[Dict[str, Any]]:
+    """Load the active promoted model pointer when it exists and targets a valid artifact."""
+
+    metadata_path = resolve_active_model_metadata_path()
+    if not os.path.exists(metadata_path):
+        return None
+
+    try:
+        payload = artifact_store.load_json(metadata_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as ex:
+        logger.warning("Failed to read active production model metadata from %s: %s", metadata_path, ex)
+        return None
+
+    model_path = payload.get("model_path")
+    if not isinstance(model_path, str) or not model_path:
+        logger.warning("Active production model metadata is missing a usable model_path: %s", metadata_path)
+        return None
+
+    if not os.path.exists(model_path):
+        logger.warning("Active production model metadata points to a missing artifact: %s", model_path)
+        return None
+
+    payload["active_model_metadata_path"] = metadata_path
+    return payload
 
 
 def resolve_retrain_algorithms_from_env() -> tuple[str, ...]:
@@ -108,7 +154,7 @@ def resolve_retrain_algorithms_from_env() -> tuple[str, ...]:
     return requested
 
 
-def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
+def resolve_model_selection_from_env() -> tuple[bool, str, Optional[str]]:
     """Resolve model path and selected algorithm from environment variables.
 
     Selection precedence:
@@ -124,7 +170,7 @@ def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
     )
 
     if explicit_model_path:
-        return explicit_model_path, selected_algorithm
+        return True, explicit_model_path, selected_algorithm
 
     if selected_algorithm:
         if selected_algorithm not in DEFAULT_MODEL_PATH_BY_ALGORITHM:
@@ -138,11 +184,34 @@ def resolve_model_selection_from_env() -> tuple[str, Optional[str]]:
             f"TYPING_ML_MODEL_PATH_{selected_algorithm.upper()}"
         )
         if algorithm_specific_path:
-            return algorithm_specific_path, selected_algorithm
+            return True, algorithm_specific_path, selected_algorithm
 
-        return DEFAULT_MODEL_PATH_BY_ALGORITHM[selected_algorithm], selected_algorithm
+        return True, DEFAULT_MODEL_PATH_BY_ALGORITHM[selected_algorithm], selected_algorithm
 
-    return DEFAULT_MODEL_PATH, None
+    return False, DEFAULT_MODEL_PATH, None
+
+
+def resolve_runtime_model_selection(
+    artifact_store: ArtifactStore,
+) -> tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve runtime model path with explicit env overrides first, then active pointer metadata."""
+
+    has_explicit_selection, model_path, selected_algorithm = resolve_model_selection_from_env()
+    if has_explicit_selection:
+        return model_path, selected_algorithm, None
+
+    active_pointer = load_active_model_pointer(artifact_store)
+    if active_pointer is not None:
+        return active_pointer["model_path"], cast(Optional[str], active_pointer.get("model_algorithm")), active_pointer
+
+    legacy_production_model_path = os.getenv(
+        "TYPING_ML_PRODUCTION_MODEL_PATH",
+        DEFAULT_PRODUCTION_MODEL_PATH,
+    )
+    if os.path.exists(legacy_production_model_path):
+        return legacy_production_model_path, None, None
+
+    return model_path, selected_algorithm, None
 
 
 def truncate_payload(raw: bytes | str, max_chars: int = MAX_TRACE_PAYLOAD_CHARS) -> str:
@@ -226,11 +295,13 @@ class InferenceService:
         artifact: Dict[str, Any],
         model_path: str,
         model_algorithm: Optional[str] = None,
+        active_model_metadata_path: Optional[str] = None,
     ) -> None:
         self.model = model
         self.artifact = artifact
         self.model_path = model_path
         self.model_algorithm = model_algorithm or artifact.get("model_name")
+        self.active_model_metadata_path = active_model_metadata_path
         self.feature_names: Optional[List[str]] = artifact.get("feature_names")
         self.label_classes: Optional[List[str]] = artifact.get("label_classes")
 
@@ -292,6 +363,7 @@ class InferenceService:
             "feature_names": self.feature_names,
             "classes": classes_list,
             "created_at": self.artifact.get("created_at"),
+            "active_model_metadata_path": self.active_model_metadata_path,
         }
 
     def predict_one(self, row: Dict[str, float]) -> Dict[str, Any]:
@@ -425,6 +497,7 @@ class TrainResponse(BaseModel):
     metrics: TrainMetricsResponse
     candidates: Dict[str, TrainLeaderboardEntryResponse]
     model_path: Optional[str] = None
+    active_model_metadata_path: Optional[str] = None
     report_path: Optional[str] = None
 
 
@@ -462,6 +535,7 @@ def persist_train_report(
         "rows_processed": response.rows_processed,
         "trained_rows": response.trained_rows,
         "model_path": response.model_path,
+        "active_model_metadata_path": response.active_model_metadata_path,
         "report_created_at": datetime.now(timezone.utc).isoformat(),
     }
     artifact_store.save_report(report_payload, report_path)
@@ -536,8 +610,8 @@ def create_app() -> FastAPI:
             background=response.background,
         )
 
-    model_path, selected_algorithm = resolve_model_selection_from_env()
     artifact_store = ArtifactStore()
+    model_path, selected_algorithm, active_model_pointer = resolve_runtime_model_selection(artifact_store)
     with start_model_internal_span("typing-ml.model.load", attributes={"typing.ml.model.path": model_path}) as span:
         model, artifact = artifact_store.load_model_artifact(model_path)
         if span is not None and span.is_recording():
@@ -545,12 +619,15 @@ def create_app() -> FastAPI:
             if selected_algorithm:
                 span.set_attribute("typing.ml.model.algorithm", selected_algorithm)
 
-    inference_service = InferenceService(model, artifact, model_path, selected_algorithm)
-    retrain_algorithms = resolve_retrain_algorithms_from_env()
-    production_model_path = os.getenv(
-        "TYPING_ML_PRODUCTION_MODEL_PATH",
-        DEFAULT_PRODUCTION_MODEL_PATH,
+    inference_service = InferenceService(
+        model,
+        artifact,
+        model_path,
+        selected_algorithm,
+        cast(Optional[str], active_model_pointer.get("active_model_metadata_path")) if active_model_pointer else None,
     )
+    retrain_algorithms = resolve_retrain_algorithms_from_env()
+    active_model_metadata_path = resolve_active_model_metadata_path()
 
     runtime_lock = RLock()
     training_lock = Lock()
@@ -728,25 +805,37 @@ def create_app() -> FastAPI:
                 target_name=TARGET_COLUMN,
                 label_classes=arena_result.retrained_label_classes,
             )
+            production_model_path = build_production_model_artifact_path(arena_result.winning_algorithm)
             artifact_store.save_model_artifact(winner_artifact, production_model_path)
+            artifact_store.save_json(
+                {
+                    "model_path": production_model_path,
+                    "model_algorithm": arena_result.winning_algorithm,
+                    "promoted_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": winner_artifact.created_at,
+                },
+                active_model_metadata_path,
+            )
 
             new_service = InferenceService(
                 arena_result.retrained_model,
                 winner_artifact.to_dict(),
                 production_model_path,
                 arena_result.winning_algorithm,
+                active_model_metadata_path,
             )
             replace_runtime_state(
                 RuntimeInferenceState(inference_service=new_service, model=arena_result.retrained_model)
             )
 
             logger.info(
-                "typing-ml retrain production completed rows=%s winner=%s accuracy=%.4f macro_f1=%.4f path=%s",
+                "typing-ml retrain production completed rows=%s winner=%s accuracy=%.4f macro_f1=%.4f path=%s active_metadata=%s",
                 arena_result.total_rows_processed,
                 arena_result.winning_algorithm,
                 arena_result.winning_accuracy,
                 arena_result.winning_f1_score,
                 production_model_path,
+                active_model_metadata_path,
             )
 
             response = TrainResponse(
@@ -763,6 +852,7 @@ def create_app() -> FastAPI:
                 metrics=metrics,
                 candidates=candidates_payload,
                 model_path=production_model_path,
+                active_model_metadata_path=active_model_metadata_path,
             )
             report_path = persist_train_report(
                 artifact_store,

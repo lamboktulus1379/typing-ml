@@ -1,5 +1,6 @@
 """Artifact persistence helpers for model and report files."""
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -71,14 +72,23 @@ class ArtifactStore:
     def save_report(self, report: Dict[str, Any], report_path: str) -> None:
         """Write JSON report to disk with stable indentation."""
 
-        report_dir = os.path.dirname(report_path)
-        if report_dir:
-            os.makedirs(report_dir, exist_ok=True)
+        self.save_json(report, report_path)
 
-        with open(report_path, "w", encoding="utf-8") as file_handle:
-            import json
+    def save_json(self, payload: Dict[str, Any], output_path: str) -> None:
+        """Write a JSON payload to disk with stable indentation."""
 
-            json.dump(report, file_handle, indent=2)
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(output_path, "w", encoding="utf-8") as file_handle:
+            json.dump(payload, file_handle, indent=2)
+
+    def load_json(self, input_path: str) -> Dict[str, Any]:
+        """Load a JSON payload from disk."""
+
+        with open(input_path, "r", encoding="utf-8") as file_handle:
+            return cast(Dict[str, Any], json.load(file_handle))
 
     def load_model_artifact(self, model_path: str) -> tuple[Any, Dict[str, Any]]:
         """Load dict-based artifacts and gracefully handle legacy model-only files."""
