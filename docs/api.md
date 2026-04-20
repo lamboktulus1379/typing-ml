@@ -194,7 +194,8 @@ Request JSON shape:
 
 Behavior:
 - If `rows` is omitted or empty, the API loads the training dataset from disk.
-- If `rows` is present, the API trains from those supplied rows instead of requiring the processed dataset to already contain the requested user.
+- If `rows` is present, the API merges those supplied rows with the persisted training dataset when that dataset is available.
+- If `rows` is present and the persisted training dataset is unavailable, the API trains from the supplied rows only.
 - The effective dataset is filtered to the requested `user_id` before deduplication and before the 80/20 split.
 - Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
 - If fewer than 20 rows remain after filtering, the API returns HTTP 400 with `Insufficient data`.

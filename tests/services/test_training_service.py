@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from services.training_service import TrainingArenaService  # noqa: E402
+from ml_pipeline.artifacts import ArtifactStore  # noqa: E402
 
 
 FINGERS = [
@@ -128,3 +129,40 @@ def test_run_algorithm_arena_filters_rows_to_requested_user_before_split() -> No
 
     assert result.total_rows_processed == len(user_b_rows)
     assert result.winning_algorithm in {"logistic_regression", "random_forest", "xgboost"}
+
+
+def test_train_personal_model_merges_inline_rows_with_persisted_dataset(tmp_path: Path) -> None:
+    service = TrainingArenaService.default(random_state=42)
+
+    persisted_rows = _build_training_frame()
+    inline_rows: list[dict[str, float | str]] = []
+
+    for scale in range(12, 16):
+        row = _build_row(float(scale))
+        row["user_id"] = "user-a"
+        row["error_left_pinky"] = 0.28 + (0.01 * (scale - 12))
+        row["error_right_index"] = 0.02
+        row["weakest_finger"] = "left_pinky"
+        inline_rows.append(row)
+
+    for scale in range(16, 20):
+        row = _build_row(float(scale))
+        row["user_id"] = "user-a"
+        row["error_left_pinky"] = 0.02
+        row["error_right_index"] = 0.28 + (0.01 * (scale - 16))
+        row["weakest_finger"] = "right_index"
+        inline_rows.append(row)
+
+    dataset_path = tmp_path / "dataset.csv"
+    persisted_rows.to_csv(dataset_path, index=False)
+
+    result = service.train_personal_model(
+        user_id="user-a",
+        data_path=str(dataset_path),
+        dataframe=pd.DataFrame(inline_rows),
+        algorithms=("logistic_regression",),
+        artifact_store=ArtifactStore(),
+        model_output_path_template=str(tmp_path / "model_{user_id}.joblib"),
+    )
+
+    assert result.arena_result.total_rows_processed == len(persisted_rows) + len(inline_rows)

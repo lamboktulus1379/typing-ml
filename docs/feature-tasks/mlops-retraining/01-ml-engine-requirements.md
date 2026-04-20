@@ -88,7 +88,8 @@ Operational requirement:
 - Full feature schema used by current model factory should be validated before training starts.
 - The retraining request must include a non-empty `user_id` value for personalized retrain mode.
 - If `rows` is omitted or empty, the worker must load the persisted processed dataset from disk.
-- If `rows` is present, the worker must train from those supplied rows instead of requiring the processed dataset to already contain the requested user.
+- If `rows` is present, the worker must merge those supplied rows with the persisted processed dataset when that dataset is available.
+- If `rows` is present and the persisted processed dataset is unavailable, the worker may train from the supplied rows only.
 - Before deduplication and before the 80/20 split, the worker must reduce the effective dataset to rows matching the requested `user_id` only.
 - If the filtered dataset contains fewer than 20 rows, the worker must reject the request with HTTP 400 and message `Insufficient data`.
 - The winning promoted artifact must be written exactly to `models/model_production_{user_id}.joblib`.

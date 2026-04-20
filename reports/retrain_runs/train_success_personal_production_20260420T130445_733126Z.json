@@ -1,0 +1,35 @@
+{
+  "status": "success_personal_production",
+  "is_dry_run": false,
+  "random_state": 42,
+  "target_column": "weakest_finger",
+  "winning_algorithm_name": "random_forest",
+  "macro_precision": 1.0,
+  "macro_recall": 1.0,
+  "top_predictive_feature": "error_right_index",
+  "primary_misclassification": "No primary misclassification detected on holdout data",
+  "total_rows_processed": 24,
+  "evaluations": [
+    {
+      "algorithmName": "logistic_regression",
+      "accuracy": 0.6,
+      "f1Score": 0.375,
+      "executionTimeMs": 59
+    },
+    {
+      "algorithmName": "random_forest",
+      "accuracy": 1.0,
+      "f1Score": 1.0,
+      "executionTimeMs": 80
+    },
+    {
+      "algorithmName": "xgboost",
+      "accuracy": 1.0,
+      "f1Score": 1.0,
+      "executionTimeMs": 55
+    }
+  ],
+  "model_path": "models/model_production_9c9c3057-3dd1-401e-a044-2a151f593094.joblib",
+  "active_model_metadata_path": null,
+  "report_created_at": "2026-04-20T13:04:45.733366+00:00"
+}

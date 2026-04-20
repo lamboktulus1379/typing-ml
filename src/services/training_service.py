@@ -150,9 +150,12 @@ class TrainingArenaService:
         model_output_path_template: str = DEFAULT_PERSONAL_MODEL_TEMPLATE,
         minimum_rows: int = DEFAULT_MIN_PERSONAL_TRAINING_ROWS,
     ) -> PersistedTrainingResult:
-        """Load the dataset, filter to one user, enforce minimum rows, and persist the winner."""
+        """Load or merge training sources, filter to one user, enforce minimum rows, and persist the winner."""
 
-        effective_dataframe = dataframe.copy() if dataframe is not None else self.load_training_dataset(data_path)
+        effective_dataframe = self._build_effective_personal_dataframe(
+            data_path=data_path,
+            inline_dataframe=dataframe,
+        )
         filtered_dataframe = self._filter_dataframe_for_user(effective_dataframe, user_id=user_id)
         if len(filtered_dataframe) < minimum_rows:
             raise ValueError("Insufficient data")
@@ -161,6 +164,26 @@ class TrainingArenaService:
         arena_result = self.run_algorithm_arena(filtered_dataframe, algorithms=algorithms)
         model_output_path = model_output_path_template.format(user_id=sanitized_user_id)
         return self._persist_training_result(arena_result, artifact_store=artifact_store, model_output_path=model_output_path)
+
+    def _build_effective_personal_dataframe(
+        self,
+        *,
+        data_path: str,
+        inline_dataframe: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """Combine persisted training history with inline rows when available."""
+
+        if inline_dataframe is None:
+            return self.load_training_dataset(data_path)
+
+        candidate_dataframe = inline_dataframe.copy()
+
+        try:
+            persisted_dataframe = self.load_training_dataset(data_path)
+        except FileNotFoundError:
+            return candidate_dataframe
+
+        return pd.concat([persisted_dataframe, candidate_dataframe], ignore_index=True, sort=False)
 
     def run_algorithm_arena(
         self,
@@ -444,7 +467,6 @@ class TrainingArenaService:
             f"True class {labels[int(true_index)]} was frequently misclassified as "
             f"{labels[int(predicted_index)]}"
         )
-
     def _build_xai_global(
         self,
         *,

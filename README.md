@@ -333,6 +333,50 @@ The final feature set is intentionally aligned with typing biomechanics:
 
 This means the standard model already includes dwell time and flight time as first-class features.
 
+Current canonical training columns (`TRAIN_FEATURE_COLUMNS`) total 26 numeric features:
+
+1. `wpm`
+2. `accuracy`
+3. `error_left_pinky`
+4. `error_left_ring`
+5. `error_left_middle`
+6. `error_left_index`
+7. `error_right_index`
+8. `error_right_middle`
+9. `error_right_ring`
+10. `error_right_pinky`
+11. `dwell_left_pinky`
+12. `dwell_left_ring`
+13. `dwell_left_middle`
+14. `dwell_left_index`
+15. `dwell_right_index`
+16. `dwell_right_middle`
+17. `dwell_right_ring`
+18. `dwell_right_pinky`
+19. `flight_left_pinky`
+20. `flight_left_ring`
+21. `flight_left_middle`
+22. `flight_left_index`
+23. `flight_right_index`
+24. `flight_right_middle`
+25. `flight_right_ring`
+26. `flight_right_pinky`
+
+Target column:
+
+- `weakest_finger`
+
+Label space:
+
+- `left_pinky`
+- `left_ring`
+- `left_middle`
+- `left_index`
+- `right_index`
+- `right_middle`
+- `right_ring`
+- `right_pinky`
+
 ### 4. Models Used in This Project
 
 Training in this repository supports three model families:
