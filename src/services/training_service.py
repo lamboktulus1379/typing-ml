@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import sklearn.metrics as sk_metrics
 import sklearn.model_selection as sk_model_selection
+from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import LabelEncoder
 
 try:
@@ -75,6 +76,7 @@ class AlgorithmArenaResult:
     top_predictive_feature: str
     primary_misclassification: str
     total_rows_processed: int
+    xai_global: dict[str, Any]
     leaderboard: tuple[AlgorithmLeaderboardEntry, ...]
     retrained_model: Any
     retrained_label_classes: list[str] | None = None
@@ -234,6 +236,12 @@ class TrainingArenaService:
         )
         top_predictive_feature = self._extract_top_predictive_feature(winner.model, list(x_train.columns))
         primary_misclassification = self._build_primary_misclassification(y_test, winner_predictions)
+        xai_global = self._build_xai_global(
+            winner=winner,
+            feature_names=list(x_train.columns),
+            y_true=y_test,
+            predictions=winner_predictions,
+        )
 
         retrained_model, retrained_label_classes, _ = self._fit_model(
             winner.name,
@@ -251,6 +259,7 @@ class TrainingArenaService:
             top_predictive_feature=top_predictive_feature,
             primary_misclassification=primary_misclassification,
             total_rows_processed=int(len(normalized_dataframe)),
+            xai_global=xai_global,
             leaderboard=leaderboard,
             retrained_model=retrained_model,
             retrained_label_classes=retrained_label_classes,
@@ -434,4 +443,117 @@ class TrainingArenaService:
         return (
             f"True class {labels[int(true_index)]} was frequently misclassified as "
             f"{labels[int(predicted_index)]}"
+        )
+
+    def _build_xai_global(
+        self,
+        *,
+        winner: AlgorithmLeaderboardEntry,
+        feature_names: list[str],
+        y_true: pd.Series,
+        predictions: Any,
+    ) -> dict[str, Any]:
+        return {
+            "confusion_matrix": self._build_confusion_matrix_payload(y_true, predictions),
+            "feature_importances": self._build_feature_importances_payload(
+                winner.name,
+                winner.model,
+                feature_names,
+            ),
+        }
+
+    @staticmethod
+    def _build_confusion_matrix_payload(y_true: pd.Series, predictions: Any) -> dict[str, Any]:
+        normalized_binary = TrainingArenaService._normalize_binary_fatigue_labels(y_true, predictions)
+        if normalized_binary is not None:
+            y_true_binary, prediction_binary = normalized_binary
+            matrix = confusion_matrix(y_true_binary, prediction_binary, labels=[0, 1])
+            return {
+                "labels": [0, 1],
+                "class_names": {"0": "Normal", "1": "Fatigued"},
+                "matrix": matrix.astype(int).tolist(),
+            }
+
+        y_true_values = [str(value) for value in y_true.tolist()]
+        prediction_values = [str(value) for value in pd.Series(predictions).tolist()]
+        labels = sorted(set(y_true_values) | set(prediction_values))
+        matrix = confusion_matrix(y_true_values, prediction_values, labels=labels)
+        return {
+            "labels": labels,
+            "matrix": matrix.astype(int).tolist(),
+        }
+
+    @staticmethod
+    def _build_feature_importances_payload(
+        algorithm: str,
+        model: Any,
+        feature_names: list[str],
+    ) -> list[dict[str, Any]]:
+        if algorithm not in {Algorithm.XGBOOST.value, Algorithm.RANDOM_FOREST.value}:
+            return []
+
+        estimator = getattr(model, "named_steps", {}).get("clf", model)
+        importance_scores = getattr(estimator, "feature_importances_", None)
+        if importance_scores is None:
+            return []
+
+        flattened_scores = np.asarray(importance_scores, dtype=float).reshape(-1)
+        if flattened_scores.size == 0 or flattened_scores.size != len(feature_names):
+            return []
+
+        importance_frame = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "importance": flattened_scores,
+            }
+        )
+        top_importances = (
+            importance_frame.sort_values("importance", ascending=False)
+            .head(10)
+            .reset_index(drop=True)
+        )
+        return [
+            {
+                "feature": str(row["feature"]),
+                "importance": float(row["importance"]),
+            }
+            for _, row in top_importances.iterrows()
+        ]
+
+    @staticmethod
+    def _normalize_binary_fatigue_labels(
+        y_true: pd.Series,
+        predictions: Any,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        def normalize_value(value: Any) -> int | None:
+            if isinstance(value, (np.integer, int, bool)):
+                numeric_value = int(value)
+                return numeric_value if numeric_value in {0, 1} else None
+
+            if isinstance(value, (np.floating, float)):
+                numeric_value = float(value)
+                if numeric_value in {0.0, 1.0}:
+                    return int(numeric_value)
+                return None
+
+            normalized_text = str(value).strip().casefold()
+            mapping = {
+                "0": 0,
+                "normal": 0,
+                "false": 0,
+                "1": 1,
+                "fatigued": 1,
+                "fatigue": 1,
+                "true": 1,
+            }
+            return mapping.get(normalized_text)
+
+        y_true_normalized = [normalize_value(value) for value in y_true.tolist()]
+        prediction_normalized = [normalize_value(value) for value in pd.Series(predictions).tolist()]
+        if any(value is None for value in y_true_normalized + prediction_normalized):
+            return None
+
+        return (
+            np.asarray(y_true_normalized, dtype=int),
+            np.asarray(prediction_normalized, dtype=int),
         )

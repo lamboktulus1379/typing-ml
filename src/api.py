@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from threading import Lock, RLock
 from typing import Any, Dict, List, Optional, Sequence, cast
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -406,17 +407,20 @@ class InferenceService:
         """Predict one row and optionally include class probabilities."""
 
         dataframe = self.build_frame([row])
+        classes = self._resolve_output_classes()
+
+        if hasattr(self.model, "predict_proba") and classes is not None:
+            probabilities = self.model.predict_proba(dataframe)[0]
+            winning_index = int(np.argmax(probabilities))
+            prediction = classes[winning_index]
+            return {
+                "prediction": prediction,
+                "confidence": float(probabilities[winning_index]) * 100.0,
+                "probabilities": {str(class_name): float(probability) for class_name, probability in zip(classes, probabilities)},
+            }
+
         prediction = self._decode_label(self.model.predict(dataframe)[0])
-        result: Dict[str, Any] = {"prediction": prediction}
-
-        has_predict_proba = hasattr(self.model, "predict_proba")
-        if has_predict_proba:
-            probs = self.model.predict_proba(dataframe)[0]
-            classes = self._resolve_output_classes()
-            if classes is not None:
-                result["probabilities"] = {str(c): float(p) for c, p in zip(classes, probs)}
-
-        return result
+        return {"prediction": prediction}
 
     def predict_many(self, rows: List[Dict[str, float]]) -> Dict[str, Any]:
         """Predict many rows and optionally include class probabilities per row."""
@@ -549,6 +553,7 @@ class TrainOrchestratorResponse(BaseModel):
     topPredictiveFeature: str
     primaryMisclassification: str
     evaluations: List[TrainEvaluationResponse]
+    xai_global: Dict[str, Any]
 
 
 def build_train_report_path(status: str) -> str:
@@ -583,6 +588,7 @@ def persist_train_report(
         "macro_recall": response.macroRecall,
         "top_predictive_feature": response.topPredictiveFeature,
         "primary_misclassification": response.primaryMisclassification,
+        "xai_global": response.xai_global,
         "total_rows_processed": total_rows_processed,
         "evaluations": [entry.model_dump() for entry in response.evaluations],
         "model_path": model_path,
@@ -741,6 +747,7 @@ def create_app() -> FastAPI:
             topPredictiveFeature=arena_result.top_predictive_feature,
             primaryMisclassification=arena_result.primary_misclassification,
             evaluations=evaluations,
+            xai_global=arena_result.xai_global,
         )
 
     def normalize_retraining_rows(
