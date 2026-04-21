@@ -110,6 +110,49 @@ def _build_dataset_training_rows() -> list[dict[str, float | str]]:
     return rows
 
 
+def _assert_predict_response(body: dict[str, object], expected_classes: set[str]) -> None:
+    assert "prediction" in body
+    assert "probabilities" in body
+    assert "confidence" in body
+    assert body["prediction"] in expected_classes
+    assert set(body["probabilities"].keys()) == expected_classes
+    assert 0.0 <= body["confidence"] <= 100.0
+
+    winning_probability = max(body["probabilities"].values())
+    assert body["confidence"] == pytest.approx(winning_probability * 100.0)
+
+
+def _assert_xai_global_payload(body: dict[str, object]) -> None:
+    assert "xai_global" in body
+    xai_global = body["xai_global"]
+    assert set(xai_global.keys()) == {"confusion_matrix", "feature_importances"}
+
+    confusion = xai_global["confusion_matrix"]
+    assert set(confusion.keys()) >= {"labels", "matrix"}
+    assert len(confusion["labels"]) == len(confusion["matrix"])
+    assert all(len(row) == len(confusion["labels"]) for row in confusion["matrix"])
+
+    feature_importances = xai_global["feature_importances"]
+    assert isinstance(feature_importances, list)
+    for entry in feature_importances:
+        assert set(entry.keys()) == {"feature", "importance"}
+        assert entry["feature"] in FEATURE_NAMES
+        assert entry["importance"] >= 0.0
+
+
+def _assert_train_response_shape(body: dict[str, object]) -> None:
+    assert set(body.keys()) == {
+        "winningAlgorithmName",
+        "macroPrecision",
+        "macroRecall",
+        "topPredictiveFeature",
+        "primaryMisclassification",
+        "evaluations",
+        "xai_global",
+    }
+    _assert_xai_global_payload(body)
+
+
 class EncodedDummyModel:
     """Minimal model stub that emits encoded class indices."""
 
@@ -327,10 +370,7 @@ def test_predict_single(api_client: TestClient) -> None:
 
     assert res.status_code == 200
     body = res.json()
-    assert "prediction" in body
-    assert body["prediction"] in {"left_index", "right_index"}
-    assert "probabilities" in body
-    assert set(body["probabilities"].keys()) == {"left_index", "right_index"}
+    _assert_predict_response(body, {"left_index", "right_index"})
 
 
 def test_predict_batch(api_client: TestClient) -> None:
@@ -377,8 +417,9 @@ def test_predict_decodes_label_classes_for_encoded_model(
 
     assert res.status_code == 200
     body = res.json()
+    _assert_predict_response(body, {"left_index", "right_index"})
     assert body["prediction"] == "right_index"
-    assert set(body["probabilities"].keys()) == {"left_index", "right_index"}
+    assert body["confidence"] == pytest.approx(90.0)
 
 
 def test_metadata_uses_algorithm_switch_model_path(
@@ -400,8 +441,9 @@ def test_predict_uses_algorithm_switch_model(
 
     assert res.status_code == 200
     body = res.json()
+    _assert_predict_response(body, {"rf_class_a", "rf_class_b"})
     assert body["prediction"] == "rf_class_a"
-    assert set(body["probabilities"].keys()) == {"rf_class_a", "rf_class_b"}
+    assert body["confidence"] == pytest.approx(80.0)
 
 
 def test_predict_uses_personalized_model_when_available(
@@ -412,8 +454,9 @@ def test_predict_uses_personalized_model_when_available(
 
     assert res.status_code == 200
     body = res.json()
+    _assert_predict_response(body, {"personalized_left", "personalized_right"})
     assert body["prediction"] == "personalized_right"
-    assert set(body["probabilities"].keys()) == {"personalized_left", "personalized_right"}
+    assert body["confidence"] == pytest.approx(95.0)
     assert body["is_fallback_used"] is False
 
 
@@ -425,8 +468,9 @@ def test_predict_falls_back_to_global_model_when_personalized_model_is_missing(
 
     assert res.status_code == 200
     body = res.json()
+    _assert_predict_response(body, {"global_left", "global_right"})
     assert body["prediction"] == "global_left"
-    assert set(body["probabilities"].keys()) == {"global_left", "global_right"}
+    assert body["confidence"] == pytest.approx(90.0)
     assert body["is_fallback_used"] is True
 
 
@@ -436,7 +480,9 @@ def test_predict_without_user_id_uses_global_model(api_client_predict_fallback: 
 
     assert res.status_code == 200
     body = res.json()
+    _assert_predict_response(body, {"global_left", "global_right"})
     assert body["prediction"] == "global_left"
+    assert body["confidence"] == pytest.approx(90.0)
     assert body["is_fallback_used"] is True
 
 
@@ -448,14 +494,7 @@ def test_train_global_saves_fixed_global_model_path(api_client: TestClient) -> N
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
-        "topPredictiveFeature",
-        "primaryMisclassification",
-        "evaluations",
-    }
+    _assert_train_response_shape(body)
     global_model_path = Path(api_client.app.extra["training_dataset_path"]).parent / "model_production_global.joblib"
     assert global_model_path.exists()
 
@@ -468,14 +507,7 @@ def test_train_personal_saves_fixed_personal_model_path(api_client: TestClient) 
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
-        "topPredictiveFeature",
-        "primaryMisclassification",
-        "evaluations",
-    }
+    _assert_train_response_shape(body)
     personal_model_path = Path(api_client.app.extra["training_dataset_path"]).parent / "model_production_user-test-1.joblib"
     assert personal_model_path.exists()
 
@@ -528,14 +560,7 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
 
     assert retrain_response.status_code == 200
     body = retrain_response.json()
-    assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
-        "topPredictiveFeature",
-        "primaryMisclassification",
-        "evaluations",
-    }
+    _assert_train_response_shape(body)
     assert body["winningAlgorithmName"] in {"logistic_regression", "random_forest", "xgboost"}
     assert 0.0 <= body["macroPrecision"] <= 1.0
     assert 0.0 <= body["macroRecall"] <= 1.0
@@ -570,6 +595,7 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
     assert report_payload["total_rows_processed"] == len(retrain_payload)
     assert len(report_payload["evaluations"]) == 3
+    assert report_payload["xai_global"] == body["xai_global"]
 
     metadata_response = api_client.get("/metadata")
     assert metadata_response.status_code == 200
@@ -580,7 +606,7 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
 
     predict_response = api_client.post("/predict", json={"row": _build_row(2.0)})
     assert predict_response.status_code == 200
-    assert "prediction" in predict_response.json()
+    _assert_predict_response(predict_response.json(), {"left_pinky", "right_pinky"})
 
 
 def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClient) -> None:
@@ -597,14 +623,7 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
-        "topPredictiveFeature",
-        "primaryMisclassification",
-        "evaluations",
-    }
+    _assert_train_response_shape(body)
     assert len(body["evaluations"]) == 3
     assert {entry["algorithmName"] for entry in body["evaluations"]} == {
         "logistic_regression",
@@ -620,6 +639,7 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
     assert report_payload["total_rows_processed"] < len(duplicated_rows)
     assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
     assert len(report_payload["evaluations"]) == 3
+    assert report_payload["xai_global"] == body["xai_global"]
 
 
 def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
@@ -645,6 +665,7 @@ def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
     assert len(report_payload["evaluations"]) == 3
     assert 0.0 <= report_payload["macro_precision"] <= 1.0
     assert 0.0 <= report_payload["macro_recall"] <= 1.0
+    assert report_payload["xai_global"] == body["xai_global"]
 
 
 def test_train_rejects_empty_rows(api_client: TestClient) -> None:
@@ -672,20 +693,14 @@ def test_train_filters_rows_to_requested_user(api_client: TestClient) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
-        "topPredictiveFeature",
-        "primaryMisclassification",
-        "evaluations",
-    }
+    _assert_train_response_shape(body)
 
     report_dir = Path(api_client.app.extra["train_reports_dir"])
     report_files = sorted(report_dir.glob("train_success_dry_run_*.json"))
     assert report_files
     report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
     assert report_payload["total_rows_processed"] == len(target_indexes)
+    assert report_payload["xai_global"] == body["xai_global"]
 
 
 def test_create_app_rejects_unsupported_algorithm_env(
