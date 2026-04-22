@@ -11,6 +11,7 @@ import sklearn.model_selection as sk_model_selection
 from sklearn.preprocessing import LabelEncoder
 
 from .artifacts import ArtifactStore, ModelArtifact
+from .cleaning import clean_timing_outliers
 from .constants import (
     ALLOWED_WEAKEST_FINGER_LABELS,
     FEATURE_RANGE_RULES,
@@ -71,13 +72,20 @@ class TrainingService:
                 f"Dataset is missing required target column '{TARGET_COLUMN}' needed for training."
             )
 
-        feature_frame = self.feature_validator.validate(
+        cleaned_dataframe = clean_timing_outliers(
             dataframe,
+            log_prefix="Training dataset timing cleaning",
+        )
+        if cleaned_dataframe.empty:
+            raise ValueError("Training dataset contains zero rows after timing outlier cleaning.")
+
+        feature_frame = self.feature_validator.validate(
+            cleaned_dataframe,
             required_columns=TRAIN_FEATURE_COLUMNS,
             context="Training dataset",
         )
         target_series = self.target_validator.validate(
-            dataframe[TARGET_COLUMN],
+            cleaned_dataframe[TARGET_COLUMN],
             target_name=TARGET_COLUMN,
             context="Training dataset",
         )

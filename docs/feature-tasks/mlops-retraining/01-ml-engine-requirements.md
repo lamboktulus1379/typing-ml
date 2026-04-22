@@ -117,6 +117,13 @@ Optional extension (recommended for UI evaluation step):
   - Load the persisted training dataset from disk into a Pandas DataFrame.
   - Permit the personalized route to receive pre-filterable in-memory rows from the Typing API admin workflow.
   - For personalized training, normalize top-level `user_id` and apply a strict filter so the DataFrame contains only rows for that user.
+  - Before feature extraction and before the 80/20 split, run a timing-telemetry cleaning step for dwell/flight features.
+  - The cleaning step must drop rows with impossible negative timing values.
+  - The cleaning step must drop rows above logical hard caps:
+    - dwell timing columns: `> 2000 ms`
+    - flight timing columns: `> 3000 ms`
+  - The cleaning step must then apply an upper-bound IQR filter to dwell/flight timing columns using `Q3 + 1.5 * IQR`.
+  - The worker must log or print DataFrame shape before and after cleaning for auditability.
   - Split into feature frame and target series.
 
 - ML-RQ-03 Standardization:
@@ -194,6 +201,7 @@ Optional extension (recommended for UI evaluation step):
 
 - ML-T01 Add dataset-backed training request models for `/train/global` and `/train/personal`.
 - ML-T02 Implement dataset loading helpers in `src/services/training_service.py`.
+- ML-T02a Implement reusable dwell/flight outlier cleaning before `train_test_split`.
 - ML-T03 Reuse existing algorithm arena evaluation and deterministic winner selection for both global and personalized training.
 - ML-T04 Persist the global winner to `models/model_production_global.joblib`.
 - ML-T05 Persist the personalized winner to `models/model_production_{user_id}.joblib`.

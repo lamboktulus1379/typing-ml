@@ -16,6 +16,7 @@ from sklearn.preprocessing import LabelEncoder
 
 try:
     from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
+    from src.ml_pipeline.cleaning import clean_timing_outliers
     from src.ml_pipeline.constants import (
         ALLOWED_WEAKEST_FINGER_LABELS,
         FEATURE_RANGE_RULES,
@@ -23,6 +24,7 @@ try:
         TRAIN_FEATURE_COLUMNS,
     )
     from src.ml_pipeline.interfaces import (
+        ArtifactStoreProtocol,
         FeatureValidatorProtocol,
         ModelFactoryProtocol,
         TargetValidatorProtocol,
@@ -31,6 +33,7 @@ try:
     from src.ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
 except ModuleNotFoundError:
     from ml_pipeline.artifacts import ArtifactStore, ModelArtifact
+    from ml_pipeline.cleaning import clean_timing_outliers
     from ml_pipeline.constants import (
         ALLOWED_WEAKEST_FINGER_LABELS,
         FEATURE_RANGE_RULES,
@@ -38,6 +41,7 @@ except ModuleNotFoundError:
         TRAIN_FEATURE_COLUMNS,
     )
     from ml_pipeline.interfaces import (
+        ArtifactStoreProtocol,
         FeatureValidatorProtocol,
         ModelFactoryProtocol,
         TargetValidatorProtocol,
@@ -210,13 +214,20 @@ class TrainingArenaService:
         if normalized_dataframe.empty:
             raise ValueError("Retraining payload contains zero unique rows after deduplication.")
 
-        feature_frame = self.feature_validator.validate(
+        cleaned_dataframe = clean_timing_outliers(
             normalized_dataframe,
+            log_prefix="Retraining payload timing cleaning",
+        )
+        if cleaned_dataframe.empty:
+            raise ValueError("Retraining payload contains zero rows after timing outlier cleaning.")
+
+        feature_frame = self.feature_validator.validate(
+            cleaned_dataframe,
             required_columns=TRAIN_FEATURE_COLUMNS,
             context="Retraining payload",
         )
         target_series = self.target_validator.validate(
-            normalized_dataframe[TARGET_COLUMN],
+            cleaned_dataframe[TARGET_COLUMN],
             target_name=TARGET_COLUMN,
             context="Retraining payload",
         )
@@ -281,7 +292,7 @@ class TrainingArenaService:
             macro_recall=macro_recall,
             top_predictive_feature=top_predictive_feature,
             primary_misclassification=primary_misclassification,
-            total_rows_processed=int(len(normalized_dataframe)),
+            total_rows_processed=int(len(cleaned_dataframe)),
             xai_global=xai_global,
             leaderboard=leaderboard,
             retrained_model=retrained_model,

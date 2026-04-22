@@ -102,6 +102,32 @@ def test_run_algorithm_arena_deduplicates_exact_rows() -> None:
     assert result.total_rows_processed == len(dataframe)
 
 
+def test_run_algorithm_arena_removes_timing_outliers_before_split() -> None:
+    service = TrainingArenaService.default(random_state=42)
+    dataframe = _build_training_frame()
+
+    negative_row = dataframe.iloc[[0]].copy(deep=True)
+    negative_row["dwell_left_pinky"] = -5.0
+
+    hard_cap_row = dataframe.iloc[[1]].copy(deep=True)
+    hard_cap_row["flight_right_index"] = 5005.0
+
+    iqr_row = dataframe.iloc[[2]].copy(deep=True)
+    iqr_row["dwell_right_pinky"] = 1200.0
+
+    noisy_dataframe = pd.concat(
+        [dataframe, negative_row, hard_cap_row, iqr_row],
+        ignore_index=True,
+    )
+
+    result = service.run_algorithm_arena(
+        noisy_dataframe,
+        algorithms=("logistic_regression", "random_forest", "xgboost"),
+    )
+
+    assert result.total_rows_processed == len(dataframe)
+
+
 def test_run_algorithm_arena_requires_algorithms() -> None:
     service = TrainingArenaService.default(random_state=42)
     dataframe = _build_training_frame()

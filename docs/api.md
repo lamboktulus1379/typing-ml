@@ -198,6 +198,11 @@ Behavior:
 - If `rows` is present and the persisted training dataset is unavailable, the API trains from the supplied rows only.
 - The effective dataset is filtered to the requested `user_id` before deduplication and before the 80/20 split.
 - Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
+- Before feature extraction and before the 80/20 split, dwell/flight telemetry rows are cleaned by:
+  - dropping negative timing values
+  - dropping biologically unlikely hard-cap rows (`dwell > 2000 ms`, `flight > 3000 ms`)
+  - applying an upper-bound IQR filter (`Q3 + 1.5 * IQR`) to dwell/flight timing columns
+- The worker logs DataFrame shape before and after timing cleaning so noisy-row removal is observable.
 - If fewer than 20 rows remain after filtering, the API returns HTTP 400 with `Insufficient data`.
 - The payload is split into 80% training data and 20% testing data using `random_state=42`.
 - Three algorithms are trained on the same training split: logistic regression, random forest, and xgboost.
