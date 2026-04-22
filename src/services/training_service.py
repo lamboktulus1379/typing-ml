@@ -10,8 +10,8 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 import sklearn.metrics as sk_metrics
-import sklearn.model_selection as sk_model_selection
 from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import cross_val_predict, cross_val_score
 from sklearn.preprocessing import LabelEncoder
 
 try:
@@ -54,6 +54,7 @@ DEFAULT_TRAINING_DATASET_PATH = "data/processed/dataset.csv"
 DEFAULT_GLOBAL_MODEL_PATH = "models/model_production_global.joblib"
 DEFAULT_PERSONAL_MODEL_TEMPLATE = "models/model_production_{user_id}.joblib"
 DEFAULT_MIN_PERSONAL_TRAINING_ROWS = 20
+DEFAULT_CV_FOLDS = 5
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,7 @@ class TrainingArenaService:
         algorithms: Sequence[str],
         user_id: str | None = None,
     ) -> AlgorithmArenaResult:
-        """Run split evaluation, pick a winner, and retrain it on the full dataset."""
+        """Run 5-fold cross-validation, pick a winner, and fit it on the full dataset."""
 
         if dataframe.empty:
             raise ValueError("Retraining payload is empty. Provide at least one row.")
@@ -235,53 +236,44 @@ class TrainingArenaService:
         if not algorithms:
             raise ValueError("No candidate algorithms were configured for retraining.")
 
-        try:
-            x_train, x_test, y_train, y_test = sk_model_selection.train_test_split(
-                feature_frame,
-                target_series,
-                test_size=0.2,
-                random_state=self.random_state,
-                stratify=target_series,
-            )
-        except ValueError as ex:
+        minimum_class_rows = int(target_series.value_counts().min())
+        if minimum_class_rows < DEFAULT_CV_FOLDS:
             raise ValueError(
-                "Failed to create stratified 80/20 train/test split. "
+                "Failed to run 5-fold cross validation. "
+                f"Each class needs at least {DEFAULT_CV_FOLDS} rows. "
                 f"Class distribution: {target_series.value_counts().to_dict()}"
-            ) from ex
+            )
 
         leaderboard = tuple(
             self._evaluate_algorithm(
                 algorithm,
-                x_train=x_train,
-                x_test=x_test,
-                y_train=y_train,
-                y_test=y_test,
-                full_target_series=target_series,
+                feature_frame=feature_frame,
+                target_series=target_series,
             )
             for algorithm in algorithms
         )
         winner = self._choose_winner(leaderboard)
-        winner_predictions = self._predict_with_optional_decoder(winner.model, x_test, winner.label_classes)
+        retrained_model = winner.model
+        retrained_label_classes = winner.label_classes
+        winner_predictions = self._cross_validated_predictions(
+            winner.name,
+            feature_frame=feature_frame,
+            target_series=target_series,
+            full_target_series=target_series,
+        )
         macro_precision = float(
-            sk_metrics.precision_score(y_test, winner_predictions, average="macro", zero_division=0)
+            sk_metrics.precision_score(target_series, winner_predictions, average="macro", zero_division=0)
         )
         macro_recall = float(
-            sk_metrics.recall_score(y_test, winner_predictions, average="macro", zero_division=0)
+            sk_metrics.recall_score(target_series, winner_predictions, average="macro", zero_division=0)
         )
-        top_predictive_feature = self._extract_top_predictive_feature(winner.model, list(x_train.columns))
-        primary_misclassification = self._build_primary_misclassification(y_test, winner_predictions)
+        top_predictive_feature = self._extract_top_predictive_feature(retrained_model, list(feature_frame.columns))
+        primary_misclassification = self._build_primary_misclassification(target_series, winner_predictions)
         xai_global = self._build_xai_global(
             winner=winner,
-            feature_names=list(x_train.columns),
-            y_true=y_test,
+            feature_names=list(feature_frame.columns),
+            y_true=target_series,
             predictions=winner_predictions,
-        )
-
-        retrained_model, retrained_label_classes, _ = self._fit_model(
-            winner.name,
-            x_train=feature_frame,
-            y_train=target_series,
-            full_target_series=target_series,
         )
 
         return AlgorithmArenaResult(
@@ -326,22 +318,46 @@ class TrainingArenaService:
         self,
         algorithm: str,
         *,
-        x_train: pd.DataFrame,
-        x_test: pd.DataFrame,
-        y_train: pd.Series,
-        y_test: pd.Series,
-        full_target_series: pd.Series,
+        feature_frame: pd.DataFrame,
+        target_series: pd.Series,
     ) -> AlgorithmLeaderboardEntry:
-        model, label_classes, execution_time_ms = self._fit_model(
+        evaluation_target, label_classes = self._encode_target_for_algorithm(
             algorithm,
-            x_train=x_train,
-            y_train=y_train,
-            full_target_series=full_target_series,
+            target_series=target_series,
+            full_target_series=target_series,
         )
-        predictions = self._predict_with_optional_decoder(model, x_test, label_classes)
+        started_at = perf_counter()
+        try:
+            f1_scores = cross_val_score(
+                self.model_factory.create(algorithm),
+                feature_frame,
+                evaluation_target,
+                cv=DEFAULT_CV_FOLDS,
+                scoring="f1_macro",
+            )
+            accuracy_scores = cross_val_score(
+                self.model_factory.create(algorithm),
+                feature_frame,
+                evaluation_target,
+                cv=DEFAULT_CV_FOLDS,
+                scoring="accuracy",
+            )
+        except ValueError as ex:
+            raise ValueError(
+                "Failed to evaluate candidate algorithms with 5-fold cross validation. "
+                f"Class distribution: {target_series.value_counts().to_dict()}"
+            ) from ex
 
-        accuracy = float(sk_metrics.accuracy_score(y_test, predictions))
-        f1_score = float(sk_metrics.f1_score(y_test, predictions, average="macro"))
+        model, label_classes, fit_execution_time_ms = self._fit_model(
+            algorithm,
+            x_train=feature_frame,
+            y_train=target_series,
+            full_target_series=target_series,
+        )
+        execution_time_ms = ((perf_counter() - started_at) * 1000.0) + fit_execution_time_ms
+
+        accuracy = float(np.mean(accuracy_scores))
+        f1_score = float(np.mean(f1_scores))
 
         return AlgorithmLeaderboardEntry(
             name=algorithm,
@@ -389,19 +405,57 @@ class TrainingArenaService:
         full_target_series: pd.Series,
     ) -> tuple[Any, list[str] | None, float]:
         model = self.model_factory.create(algorithm)
-
-        label_encoder: LabelEncoder | None = None
-        y_train_for_fit: Any = y_train
-        if algorithm == Algorithm.XGBOOST.value:
-            label_encoder = LabelEncoder()
-            label_encoder.fit(full_target_series)
-            y_train_for_fit = label_encoder.transform(y_train)
+        y_train_for_fit, label_classes = self._encode_target_for_algorithm(
+            algorithm,
+            target_series=y_train,
+            full_target_series=full_target_series,
+        )
 
         started_at = perf_counter()
         model.fit(x_train, y_train_for_fit)
         execution_time_ms = (perf_counter() - started_at) * 1000.0
 
-        return model, (label_encoder.classes_.tolist() if label_encoder is not None else None), execution_time_ms
+        return model, label_classes, execution_time_ms
+
+    def _encode_target_for_algorithm(
+        self,
+        algorithm: str,
+        *,
+        target_series: pd.Series,
+        full_target_series: pd.Series,
+    ) -> tuple[pd.Series, list[str] | None]:
+        if algorithm != Algorithm.XGBOOST.value:
+            return target_series, None
+
+        label_encoder = LabelEncoder()
+        label_encoder.fit(full_target_series)
+        encoded_target = pd.Series(
+            label_encoder.transform(target_series),
+            index=target_series.index,
+        )
+        return encoded_target, label_encoder.classes_.tolist()
+
+    def _cross_validated_predictions(
+        self,
+        algorithm: str,
+        *,
+        feature_frame: pd.DataFrame,
+        target_series: pd.Series,
+        full_target_series: pd.Series,
+    ) -> Any:
+        encoded_target, label_classes = self._encode_target_for_algorithm(
+            algorithm,
+            target_series=target_series,
+            full_target_series=full_target_series,
+        )
+        predictions = cross_val_predict(
+            self.model_factory.create(algorithm),
+            feature_frame,
+            encoded_target,
+            cv=DEFAULT_CV_FOLDS,
+            method="predict",
+        )
+        return self._decode_predictions(predictions, label_classes)
 
     @staticmethod
     def _predict_with_optional_decoder(
@@ -410,6 +464,10 @@ class TrainingArenaService:
         label_classes: list[str] | None,
     ) -> Any:
         predictions = model.predict(x_test)
+        return TrainingArenaService._decode_predictions(predictions, label_classes)
+
+    @staticmethod
+    def _decode_predictions(predictions: Any, label_classes: list[str] | None) -> Any:
         if label_classes is None:
             return predictions
 
@@ -463,7 +521,7 @@ class TrainingArenaService:
         labels = sorted(set(y_true_values) | set(prediction_values))
 
         if not labels:
-            return "No primary misclassification detected on holdout data"
+            return "No primary misclassification detected on evaluation data"
 
         confusion = sk_metrics.confusion_matrix(y_true_values, prediction_values, labels=labels)
         off_diagonal = confusion.copy()
@@ -471,7 +529,7 @@ class TrainingArenaService:
 
         largest_error = int(off_diagonal.max()) if off_diagonal.size else 0
         if largest_error <= 0:
-            return "No primary misclassification detected on holdout data"
+            return "No primary misclassification detected on evaluation data"
 
         true_index, predicted_index = np.argwhere(off_diagonal == largest_error)[0]
         return (

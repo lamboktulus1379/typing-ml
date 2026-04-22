@@ -140,6 +140,21 @@ def test_run_algorithm_arena_requires_algorithms() -> None:
         raise AssertionError("Expected ValueError when no algorithms are provided")
 
 
+def test_run_algorithm_arena_requires_at_least_five_rows_per_class_for_cv() -> None:
+    service = TrainingArenaService.default(random_state=42)
+    dataframe = _build_training_frame().iloc[[0, 1, 2, 3, 6, 7, 8, 9]].copy(deep=True)
+
+    try:
+        service.run_algorithm_arena(
+            dataframe,
+            algorithms=("logistic_regression", "random_forest", "xgboost"),
+        )
+    except ValueError as ex:
+        assert "5-fold cross validation" in str(ex)
+    else:
+        raise AssertionError("Expected ValueError when a class has fewer than five rows")
+
+
 def test_run_algorithm_arena_filters_rows_to_requested_user_before_split() -> None:
     service = TrainingArenaService.default(random_state=42)
     user_a_rows = _build_training_frame()
