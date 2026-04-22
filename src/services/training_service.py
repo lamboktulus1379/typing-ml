@@ -98,7 +98,12 @@ class PersistedTrainingResult:
 
 @dataclass
 class TrainingArenaService:
-    """Validates payloads, evaluates candidate algorithms, and retrains the winner."""
+    """Coordinate personalized AutoML selection for fatigue and typing telemetry.
+
+    The service applies data validation and cleaning, evaluates multiple candidate
+    algorithms, selects the best-performing model for the current telemetry slice,
+    and returns a fully fitted model ready for persistence.
+    """
 
     model_factory: ModelFactoryProtocol
     feature_validator: FeatureValidatorProtocol
@@ -155,7 +160,13 @@ class TrainingArenaService:
         model_output_path_template: str = DEFAULT_PERSONAL_MODEL_TEMPLATE,
         minimum_rows: int = DEFAULT_MIN_PERSONAL_TRAINING_ROWS,
     ) -> PersistedTrainingResult:
-        """Load or merge training sources, filter to one user, enforce minimum rows, and persist the winner."""
+        """Train and persist a user-specific champion model.
+
+        The personalized path merges persisted history with optional inline rows,
+        restricts the effective dataset to the requested user, enforces a minimum
+        evidence threshold, and then runs the algorithm tournament only on that
+        user-specific telemetry.
+        """
 
         effective_dataframe = self._build_effective_personal_dataframe(
             data_path=data_path,
@@ -176,7 +187,12 @@ class TrainingArenaService:
         data_path: str,
         inline_dataframe: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        """Combine persisted training history with inline rows when available."""
+        """Combine persisted training history with newly supplied inline rows.
+
+        This preserves longitudinal evidence from previous sessions while still
+        allowing the API caller to inject fresh telemetry collected in the most
+        recent typing workflow.
+        """
 
         if inline_dataframe is None:
             return self.load_training_dataset(data_path)
@@ -197,7 +213,13 @@ class TrainingArenaService:
         algorithms: Sequence[str],
         user_id: str | None = None,
     ) -> AlgorithmArenaResult:
-        """Run 5-fold cross-validation, pick a winner, and fit it on the full dataset."""
+        """Run a personalized algorithm tournament using 5-fold cross validation.
+
+        The tournament cleans and validates the telemetry subset, evaluates all
+        candidate algorithms with the same cross-validation protocol, selects the
+        champion by Macro F1-Score, and returns that champion already fitted on
+        100% of the cleaned dataset for downstream persistence.
+        """
 
         if dataframe.empty:
             raise ValueError("Retraining payload is empty. Provide at least one row.")
@@ -215,6 +237,8 @@ class TrainingArenaService:
         if normalized_dataframe.empty:
             raise ValueError("Retraining payload contains zero unique rows after deduplication.")
 
+        # Remove implausible pauses and extreme timing artifacts before model
+        # comparison so the tournament reflects real typing behavior.
         cleaned_dataframe = clean_timing_outliers(
             normalized_dataframe,
             log_prefix="Retraining payload timing cleaning",
@@ -236,6 +260,7 @@ class TrainingArenaService:
         if not algorithms:
             raise ValueError("No candidate algorithms were configured for retraining.")
 
+        # Stratified 5-fold evaluation requires each class to appear in every fold.
         minimum_class_rows = int(target_series.value_counts().min())
         if minimum_class_rows < DEFAULT_CV_FOLDS:
             raise ValueError(
@@ -244,6 +269,8 @@ class TrainingArenaService:
                 f"Class distribution: {target_series.value_counts().to_dict()}"
             )
 
+        # Every algorithm competes under the same evaluation protocol so model
+        # selection is driven by evidence rather than a lucky partition.
         leaderboard = tuple(
             self._evaluate_algorithm(
                 algorithm,
@@ -255,6 +282,9 @@ class TrainingArenaService:
         winner = self._choose_winner(leaderboard)
         retrained_model = winner.model
         retrained_label_classes = winner.label_classes
+
+        # Cross-validated out-of-fold predictions are used to summarize the
+        # champion's class-level behavior across the full telemetry slice.
         winner_predictions = self._cross_validated_predictions(
             winner.name,
             feature_frame=feature_frame,
@@ -293,7 +323,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _filter_dataframe_for_user(dataframe: pd.DataFrame, *, user_id: str | None) -> pd.DataFrame:
-        """Reduce the payload to one requested user before train/test splitting."""
+        """Reduce the payload to the requested user before tournament scoring."""
 
         if user_id is None:
             return dataframe.copy()
@@ -321,6 +351,12 @@ class TrainingArenaService:
         feature_frame: pd.DataFrame,
         target_series: pd.Series,
     ) -> AlgorithmLeaderboardEntry:
+        """Evaluate one candidate algorithm under the shared K-fold protocol.
+
+        Macro F1 is used as the primary selection signal because personalized
+        keystroke datasets can exhibit class imbalance, and macro averaging keeps
+        minority classes visible during model comparison.
+        """
         evaluation_target, label_classes = self._encode_target_for_algorithm(
             algorithm,
             target_series=target_series,
@@ -328,6 +364,8 @@ class TrainingArenaService:
         )
         started_at = perf_counter()
         try:
+            # Macro F1 is the ranking metric for the academic tournament because
+            # it weights each class equally across user-specific telemetry.
             f1_scores = cross_val_score(
                 self.model_factory.create(algorithm),
                 feature_frame,
@@ -335,6 +373,7 @@ class TrainingArenaService:
                 cv=DEFAULT_CV_FOLDS,
                 scoring="f1_macro",
             )
+            # Accuracy is retained as a secondary signal and deterministic tie-break.
             accuracy_scores = cross_val_score(
                 self.model_factory.create(algorithm),
                 feature_frame,
@@ -348,6 +387,8 @@ class TrainingArenaService:
                 f"Class distribution: {target_series.value_counts().to_dict()}"
             ) from ex
 
+        # After tournament scoring, the same candidate is refit on 100% of the
+        # available cleaned data so the persisted artifact uses all evidence.
         model, label_classes, fit_execution_time_ms = self._fit_model(
             algorithm,
             x_train=feature_frame,
@@ -370,6 +411,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _sanitize_user_id_for_path(user_id: str) -> str:
+        """Normalize a user identifier so it is safe to embed in artifact paths."""
         normalized = user_id.strip().lower()
         sanitized = "".join(character if character.isalnum() or character in {"_", "-"} else "_" for character in normalized)
         sanitized = sanitized.strip("_")
@@ -382,6 +424,10 @@ class TrainingArenaService:
         artifact_store: ArtifactStoreProtocol,
         model_output_path: str,
     ) -> PersistedTrainingResult:
+        """Persist the winning model artifact and return its storage metadata."""
+
+        # Persist the champion as a joblib-backed artifact so the inference layer
+        # can reload a concrete, versionable model object without retraining.
         artifact = ModelArtifact.from_training(
             model=arena_result.retrained_model,
             model_name=arena_result.winning_algorithm,
@@ -404,6 +450,7 @@ class TrainingArenaService:
         y_train: pd.Series,
         full_target_series: pd.Series,
     ) -> tuple[Any, list[str] | None, float]:
+        """Fit one candidate model on the supplied dataset and time the operation."""
         model = self.model_factory.create(algorithm)
         y_train_for_fit, label_classes = self._encode_target_for_algorithm(
             algorithm,
@@ -424,6 +471,7 @@ class TrainingArenaService:
         target_series: pd.Series,
         full_target_series: pd.Series,
     ) -> tuple[pd.Series, list[str] | None]:
+        """Encode target labels only for estimators that require numeric classes."""
         if algorithm != Algorithm.XGBOOST.value:
             return target_series, None
 
@@ -443,6 +491,11 @@ class TrainingArenaService:
         target_series: pd.Series,
         full_target_series: pd.Series,
     ) -> Any:
+        """Generate out-of-fold predictions for the selected champion model.
+
+        These predictions are used for evaluation-oriented summaries such as the
+        confusion matrix and the primary misclassification narrative.
+        """
         encoded_target, label_classes = self._encode_target_for_algorithm(
             algorithm,
             target_series=target_series,
@@ -468,6 +521,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _decode_predictions(predictions: Any, label_classes: list[str] | None) -> Any:
+        """Map numeric predictions back to original labels when encoding was used."""
         if label_classes is None:
             return predictions
 
@@ -480,6 +534,11 @@ class TrainingArenaService:
     def _choose_winner(
         leaderboard: Sequence[AlgorithmLeaderboardEntry],
     ) -> AlgorithmLeaderboardEntry:
+        """Choose the champion model from the tournament leaderboard.
+
+        The ranking rule prioritizes Macro F1-Score, then mean accuracy, and
+        finally lexical algorithm order to keep winner selection reproducible.
+        """
         if not leaderboard:
             raise ValueError("No candidate models were produced during retraining.")
 
@@ -491,6 +550,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _extract_top_predictive_feature(model: Any, feature_names: list[str]) -> str:
+        """Identify the strongest predictive feature exposed by the fitted model."""
         estimator = getattr(model, "named_steps", {}).get("clf", model)
 
         importance_scores = getattr(estimator, "feature_importances_", None)
@@ -516,6 +576,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _build_primary_misclassification(y_true: pd.Series, predictions: Any) -> str:
+        """Summarize the most prominent off-diagonal error in the evaluation matrix."""
         y_true_values = [str(value) for value in y_true.tolist()]
         prediction_values = [str(value) for value in pd.Series(predictions).tolist()]
         labels = sorted(set(y_true_values) | set(prediction_values))
@@ -536,6 +597,7 @@ class TrainingArenaService:
             f"True class {labels[int(true_index)]} was frequently misclassified as "
             f"{labels[int(predicted_index)]}"
         )
+
     def _build_xai_global(
         self,
         *,
@@ -544,6 +606,7 @@ class TrainingArenaService:
         y_true: pd.Series,
         predictions: Any,
     ) -> dict[str, Any]:
+        """Build global explanatory artifacts for the tournament champion."""
         return {
             "confusion_matrix": self._build_confusion_matrix_payload(y_true, predictions),
             "feature_importances": self._build_feature_importances_payload(
@@ -555,6 +618,7 @@ class TrainingArenaService:
 
     @staticmethod
     def _build_confusion_matrix_payload(y_true: pd.Series, predictions: Any) -> dict[str, Any]:
+        """Serialize a confusion matrix payload for UI and report consumers."""
         normalized_binary = TrainingArenaService._normalize_binary_fatigue_labels(y_true, predictions)
         if normalized_binary is not None:
             y_true_binary, prediction_binary = normalized_binary
@@ -580,6 +644,7 @@ class TrainingArenaService:
         model: Any,
         feature_names: list[str],
     ) -> list[dict[str, Any]]:
+        """Return the top feature importances for tree-based tournament winners."""
         if algorithm not in {Algorithm.XGBOOST.value, Algorithm.RANDOM_FOREST.value}:
             return []
 
@@ -616,6 +681,7 @@ class TrainingArenaService:
         y_true: pd.Series,
         predictions: Any,
     ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Normalize supported fatigue labels into a binary confusion-matrix space."""
         def normalize_value(value: Any) -> int | None:
             if isinstance(value, (np.integer, int, bool)):
                 numeric_value = int(value)
