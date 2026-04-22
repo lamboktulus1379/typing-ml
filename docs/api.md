@@ -175,7 +175,9 @@ Request body:
 Behavior:
 - The API loads the training dataset from disk.
 - No user filtering is applied.
-- The existing algorithm arena still evaluates logistic regression, random forest, and xgboost on the same split policy.
+- The existing algorithm arena evaluates logistic regression, random forest, and xgboost with 5-fold cross validation.
+- The winning algorithm is selected by highest mean macro F1-score.
+- After winner selection, the winning model is fit on 100% of the cleaned dataset before it is persisted.
 - The winning model is persisted as `models/model_production_global.joblib`.
 - The response returns the existing evaluation report contract.
 
@@ -196,22 +198,21 @@ Behavior:
 - If `rows` is omitted or empty, the API loads the training dataset from disk.
 - If `rows` is present, the API merges those supplied rows with the persisted training dataset when that dataset is available.
 - If `rows` is present and the persisted training dataset is unavailable, the API trains from the supplied rows only.
-- The effective dataset is filtered to the requested `user_id` before deduplication and before the 80/20 split.
-- Duplicate rows are removed (`drop_duplicates`) before train/test split for deterministic retraining math.
-- Before feature extraction and before the 80/20 split, dwell/flight telemetry rows are cleaned by:
+- The effective dataset is filtered to the requested `user_id` before deduplication and before 5-fold cross validation.
+- Duplicate rows are removed (`drop_duplicates`) before cross-validation scoring for deterministic retraining math.
+- Before feature extraction and before 5-fold cross-validation scoring, dwell/flight telemetry rows are cleaned by:
   - dropping negative timing values
   - dropping biologically unlikely hard-cap rows (`dwell > 2000 ms`, `flight > 3000 ms`)
   - applying an upper-bound IQR filter (`Q3 + 1.5 * IQR`) to dwell/flight timing columns
 - The worker logs DataFrame shape before and after timing cleaning so noisy-row removal is observable.
 - If fewer than 20 rows remain after filtering, the API returns HTTP 400 with `Insufficient data`.
-- The payload is split into 80% training data and 20% testing data using `random_state=42`.
-- Three algorithms are trained on the same training split: logistic regression, random forest, and xgboost.
+- Three algorithms are evaluated with 5-fold cross validation: logistic regression, random forest, and xgboost.
 - Each candidate reports:
-  - `accuracy`
-  - `f1_score` (macro F1)
+  - mean `accuracy`
+  - mean `f1_score` (macro F1)
   - `execution_time_ms`
-- The winner is chosen by highest macro F1-score.
-- After the winner is selected, that winning algorithm is retrained from scratch on 100% of the filtered dataset.
+- The winner is chosen by highest mean macro F1-score.
+- After the winner is selected, that winning algorithm is fit on 100% of the filtered dataset.
 - The winning model is saved as `models/model_production_{user_id}.joblib`.
 
 Compatibility note:

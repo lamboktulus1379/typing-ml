@@ -4,6 +4,14 @@
 
 Provide training worker endpoints that load the persisted dataset, train candidate models, select the best model by F1-score, save a fixed global or personalized production artifact, hot-reload runtime inference without server restart, and support per-user personalized training requests without changing the core winner/evaluation logic. Also support inference cold-start handling so `/predict` can fall back to a global baseline model when a personalized model does not yet exist for the requested user.
 
+## AutoML Algorithm Selection via K-Fold Cross Validation
+
+To improve academic rigor and reduce the risk of a lucky or unlucky single split, the AutoML selection stage uses 5-fold cross validation instead of a single 80/20 holdout split. In a standard holdout evaluation, the measured performance can change materially depending on which rows happen to fall into the training partition and which rows happen to fall into the test partition. That makes the winner sensitive to partition noise rather than model quality.
+
+Under 5-fold cross validation, the cleaned personalized dataset is partitioned into five folds. Each candidate algorithm is trained five times. On each iteration, four folds are used for fitting and the remaining fold is used for validation. This process is repeated until every fold has served once as the validation fold. The three candidate algorithms evaluated in this AutoML stage are XGBoost, Random Forest, and Logistic Regression.
+
+For each algorithm, the validation outcome from the five folds is summarized as a Mean Macro F1-Score. Macro F1 is used because it weights each class equally and is therefore more appropriate than raw accuracy when class balance may vary across users or fatigue states. The Winning Algorithm is the model with the highest Mean Macro F1-Score across the five folds. After that selection step, the winner is refit on 100% of the cleaned personalized dataset so the persisted artifact is trained on all available evidence before it is saved.
+
 ## In Scope
 
 - New endpoint: `POST /train/global`.
@@ -18,7 +26,7 @@ Provide training worker endpoints that load the persisted dataset, train candida
 - Save the global winner artifact exactly as `models/model_production_global.joblib`.
 - Save the personalized winner artifact exactly as `models/model_production_{user_id}.joblib`.
 - Personalized retraining request support via top-level `user_id`.
-- Strict per-user dataset filtering before the 80/20 train/test split.
+- Strict per-user dataset filtering before the 5-fold cross-validation stage.
 - Personalized requests must reject insufficient data when filtered rows are fewer than 20.
 - Hot-reload in-process model used by `/predict` and `/predict_batch`.
 - Cold-start fallback in `POST /predict` for user-specific inference.
@@ -90,7 +98,7 @@ Operational requirement:
 - If `rows` is omitted or empty, the worker must load the persisted processed dataset from disk.
 - If `rows` is present, the worker must merge those supplied rows with the persisted processed dataset when that dataset is available.
 - If `rows` is present and the persisted processed dataset is unavailable, the worker may train from the supplied rows only.
-- Before deduplication and before the 80/20 split, the worker must reduce the effective dataset to rows matching the requested `user_id` only.
+- Before deduplication and before 5-fold cross validation, the worker must reduce the effective dataset to rows matching the requested `user_id` only.
 - If the filtered dataset contains fewer than 20 rows, the worker must reject the request with HTTP 400 and message `Insufficient data`.
 - The winning promoted artifact must be written exactly to `models/model_production_{user_id}.joblib`.
 
@@ -117,7 +125,7 @@ Optional extension (recommended for UI evaluation step):
   - Load the persisted training dataset from disk into a Pandas DataFrame.
   - Permit the personalized route to receive pre-filterable in-memory rows from the Typing API admin workflow.
   - For personalized training, normalize top-level `user_id` and apply a strict filter so the DataFrame contains only rows for that user.
-  - Before feature extraction and before the 80/20 split, run a timing-telemetry cleaning step for dwell/flight features.
+  - Before feature extraction and before 5-fold cross-validation scoring, run a timing-telemetry cleaning step for dwell/flight features.
   - The cleaning step must drop rows with impossible negative timing values.
   - The cleaning step must drop rows above logical hard caps:
     - dwell timing columns: `> 2000 ms`
@@ -131,15 +139,17 @@ Optional extension (recommended for UI evaluation step):
 
 - ML-RQ-04 Candidate training:
   - Train 3 candidate models in one retrain call.
+  - Evaluate candidates with 5-fold cross validation.
   - Run candidates concurrently when possible.
 
 - ML-RQ-05 Evaluation:
-  - Compute accuracy and F1-score per candidate on the same split policy.
+  - Compute accuracy and F1-score per candidate across the same 5 folds.
+  - Use Mean Macro F1-Score as the primary AutoML selection metric.
 
 - ML-RQ-06 Winner selection:
-  - Primary criterion: highest F1-score.
+  - Primary criterion: highest Mean Macro F1-Score.
   - Deterministic tie-break requirement:
-    - Higher accuracy wins ties.
+    - Higher mean accuracy wins ties.
     - If still tied, lexical order of algorithm key for deterministic reproducibility.
 
 - ML-RQ-07 Artifact output:
@@ -187,7 +197,7 @@ Optional extension (recommended for UI evaluation step):
 
 - ML-AC-01 `POST /train/global` loads the dataset from disk, trains candidate models, and returns the winner metrics.
 - ML-AC-02 Global training writes the promoted artifact exactly to `models/model_production_global.joblib`.
-- ML-AC-03 `POST /train/personal` filters the dataset to the requested `user_id` before the 80/20 split.
+- ML-AC-03 `POST /train/personal` filters the dataset to the requested `user_id` before 5-fold cross validation.
 - ML-AC-04 Personalized training writes the promoted artifact exactly to `models/model_production_{user_id}.joblib`.
 - ML-AC-05 Personalized training rejects requests with fewer than 20 filtered rows using HTTP 400 `Insufficient data`.
 - ML-AC-05a Personalized training accepts inline admin-supplied rows and uses them even when the persisted processed dataset does not already contain that user.
@@ -201,7 +211,8 @@ Optional extension (recommended for UI evaluation step):
 
 - ML-T01 Add dataset-backed training request models for `/train/global` and `/train/personal`.
 - ML-T02 Implement dataset loading helpers in `src/services/training_service.py`.
-- ML-T02a Implement reusable dwell/flight outlier cleaning before `train_test_split`.
+- ML-T02a Implement reusable dwell/flight outlier cleaning before cross-validation scoring.
+- ML-T03a Replace single-split winner selection with 5-fold cross validation scored by macro F1.
 - ML-T03 Reuse existing algorithm arena evaluation and deterministic winner selection for both global and personalized training.
 - ML-T04 Persist the global winner to `models/model_production_global.joblib`.
 - ML-T05 Persist the personalized winner to `models/model_production_{user_id}.joblib`.
