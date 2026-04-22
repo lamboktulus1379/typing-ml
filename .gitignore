@@ -75,6 +75,7 @@ models/
 reports/figures/
 reports/figures_*/
 reports/*.json
+reports/retrain_runs/*.json
 reports/results_filled_*.md
 
 # Keep results.md tracked (experiment notes)
@@ -84,6 +85,11 @@ reports/results_filled_*.md
 # Logs
 # =========================
 *.log
+
+# =========================
+# Test runner outputs
+# =========================
+test-results/
 
 # =========================
 # Optional: Notebooks output cleanup
