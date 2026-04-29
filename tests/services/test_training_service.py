@@ -140,6 +140,28 @@ def test_run_algorithm_arena_requires_algorithms() -> None:
         raise AssertionError("Expected ValueError when no algorithms are provided")
 
 
+def test_run_algorithm_arena_returns_logistic_feature_importances_from_scaled_coefficients() -> None:
+    service = TrainingArenaService.default(random_state=42)
+    dataframe = _build_training_frame()
+
+    result = service.run_algorithm_arena(
+        dataframe,
+        algorithms=("logistic_regression",),
+    )
+
+    assert result.winning_algorithm == "logistic_regression"
+    feature_importances = result.xai_global["feature_importances"]
+    assert feature_importances
+    assert len(feature_importances) <= 10
+    assert feature_importances == sorted(
+        feature_importances,
+        key=lambda entry: entry["importance"],
+        reverse=True,
+    )
+    assert all(entry["feature"] in dataframe.columns for entry in feature_importances)
+    assert all(entry["importance"] >= 0.0 for entry in feature_importances)
+
+
 def test_run_algorithm_arena_requires_at_least_five_rows_per_class_for_cv() -> None:
     service = TrainingArenaService.default(random_state=42)
     dataframe = _build_training_frame().iloc[[0, 1, 2, 3, 6, 7, 8, 9]].copy(deep=True)
