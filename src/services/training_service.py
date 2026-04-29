@@ -644,7 +644,13 @@ class TrainingArenaService:
         model: Any,
         feature_names: list[str],
     ) -> list[dict[str, Any]]:
-        """Return the top feature importances for tree-based tournament winners."""
+        """Return normalized global feature importance payload for supported winners."""
+        if algorithm == Algorithm.LOGISTIC_REGRESSION.value:
+            return TrainingArenaService._build_logistic_feature_importances_payload(
+                model,
+                feature_names,
+            )
+
         if algorithm not in {Algorithm.XGBOOST.value, Algorithm.RANDOM_FOREST.value}:
             return []
 
@@ -654,6 +660,64 @@ class TrainingArenaService:
             return []
 
         flattened_scores = np.asarray(importance_scores, dtype=float).reshape(-1)
+        if flattened_scores.size == 0 or flattened_scores.size != len(feature_names):
+            return []
+
+        importance_frame = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "importance": flattened_scores,
+            }
+        )
+        top_importances = (
+            importance_frame.sort_values("importance", ascending=False)
+            .head(10)
+            .reset_index(drop=True)
+        )
+        return [
+            {
+                "feature": str(row["feature"]),
+                "importance": float(row["importance"]),
+            }
+            for _, row in top_importances.iterrows()
+        ]
+
+    @staticmethod
+    def _build_logistic_feature_importances_payload(
+        model: Any,
+        feature_names: list[str],
+    ) -> list[dict[str, Any]]:
+        """Return absolute standardized logistic-regression coefficients as feature importance.
+
+        The winning logistic-regression model is expected to be fitted through the shared
+        sklearn Pipeline that includes a StandardScaler step. For binary classification,
+        this uses ``np.abs(model.coef_[0])``. For multi-class classifiers, it averages the
+        absolute coefficients across classes to produce one global importance score per
+        feature.
+        """
+        if not feature_names:
+            return []
+
+        named_steps = getattr(model, "named_steps", None)
+        estimator = named_steps.get("clf", model) if named_steps else model
+        scaler = named_steps.get("scaler") if named_steps else None
+
+        if scaler is None or not hasattr(scaler, "scale_"):
+            return []
+
+        coefficients = getattr(estimator, "coef_", None)
+        if coefficients is None:
+            return []
+
+        absolute_coefficients = np.abs(np.asarray(coefficients, dtype=float))
+        if absolute_coefficients.ndim == 1:
+            flattened_scores = absolute_coefficients
+        elif absolute_coefficients.shape[0] == 1:
+            flattened_scores = absolute_coefficients[0]
+        else:
+            flattened_scores = absolute_coefficients.mean(axis=0)
+
+        flattened_scores = np.asarray(flattened_scores, dtype=float).reshape(-1)
         if flattened_scores.size == 0 or flattened_scores.size != len(feature_names):
             return []
 
