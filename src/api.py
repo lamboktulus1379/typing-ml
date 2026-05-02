@@ -19,6 +19,7 @@ import os
 import logging
 import json
 import re
+from time import perf_counter
 from datetime import datetime, timezone
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, cast
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.routing import APIRoute
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
@@ -55,7 +56,7 @@ except ModuleNotFoundError:
     from services.training_service import TrainingArenaService
 
 
-MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "4096"))
+MAX_TRACE_PAYLOAD_CHARS = int(os.getenv("TYPING_ML_TRACE_PAYLOAD_CHARS", "2000"))
 logger = logging.getLogger("typing-ml")
 
 DEFAULT_MODEL_PATH = "models/model.joblib"
@@ -267,6 +268,109 @@ def compact_json_if_possible(payload: str) -> str:
         return json.dumps(json.loads(payload), separators=(",", ":"))
     except json.JSONDecodeError:
         return payload
+
+
+def serialize_json_payload(payload: Any) -> str:
+    """Serialize a Python payload into deterministic compact JSON for logs and spans."""
+
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def get_current_otel_span() -> Any | None:
+    """Return the current active OpenTelemetry span when tracing is available."""
+
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if span is not None and span.is_recording():
+            return span
+    except Exception:
+        return None
+
+    return None
+
+
+def record_predict_payloads_on_spans(
+    spans: Sequence[Any],
+    *,
+    request_payload: Optional[str] = None,
+    response_payload: Optional[str] = None,
+    inference_time_ms: Optional[float] = None,
+) -> None:
+    """Attach predict request/response payloads and timing to active spans."""
+
+    seen_spans: set[int] = set()
+    for span in spans:
+        if span is None:
+            continue
+
+        span_identity = id(span)
+        if span_identity in seen_spans:
+            continue
+        seen_spans.add(span_identity)
+
+        try:
+            if not span.is_recording():
+                continue
+
+            if request_payload is not None:
+                span.set_attribute("app.request.payload", request_payload)
+                span.add_event("app.request.payload", {"payload": request_payload})
+
+            if response_payload is not None:
+                span.set_attribute("app.response.payload", response_payload)
+                span.add_event("app.response.payload", {"payload": response_payload})
+
+            if inference_time_ms is not None:
+                span.set_attribute("app.inference_time_ms", inference_time_ms)
+        except Exception:
+            continue
+
+
+def log_endpoint_payloads(
+    endpoint_name: str,
+    *,
+    request_payload: Any,
+    response_payload: Any,
+    spans: Sequence[Any],
+    execution_time_ms: Optional[float] = None,
+    inference_time_ms: Optional[float] = None,
+) -> None:
+    """Emit consistent endpoint request/response logs and span payload attributes."""
+
+    request_payload_json = serialize_json_payload(request_payload)
+    response_payload_json = serialize_json_payload(response_payload)
+
+    logger.info("%s.request payload=%s", endpoint_name, request_payload_json)
+    logger.info("%s.response payload=%s", endpoint_name, response_payload_json)
+
+    record_predict_payloads_on_spans(
+        spans,
+        request_payload=request_payload_json,
+        response_payload=response_payload_json,
+        inference_time_ms=inference_time_ms,
+    )
+
+    seen_spans: set[int] = set()
+    for span in spans:
+        if span is None:
+            continue
+
+        span_identity = id(span)
+        if span_identity in seen_spans:
+            continue
+        seen_spans.add(span_identity)
+
+        try:
+            if not span.is_recording():
+                continue
+
+            span.set_attribute("app.endpoint.name", endpoint_name)
+            if execution_time_ms is not None:
+                span.set_attribute("app.execution_time_ms", execution_time_ms)
+        except Exception:
+            continue
 
 
 def configure_optional_otel(app: FastAPI) -> None:
@@ -608,61 +712,51 @@ def create_app() -> FastAPI:
         ),
     )
 
+    class PayloadTracingRoute(APIRoute):
+        def get_route_handler(self):
+            original_route_handler = super().get_route_handler()
+
+            async def traced_route_handler(request: Request):
+                raw_request_body = await request.body()
+                request_payload = compact_json_if_possible(truncate_payload(raw_request_body))
+
+                span = get_current_otel_span()
+                if span is not None and span.is_recording():
+                    span.set_attribute("app.http.request.method", request.method)
+                    span.set_attribute("app.http.request.path", request.url.path)
+                    span.set_attribute("app.http.request.payload", request_payload)
+                    span.add_event("app.http.request.payload", {"payload": request_payload})
+
+                response = await original_route_handler(request)
+
+                raw_response_body = getattr(response, "body", b"") or b""
+                response_payload = compact_json_if_possible(truncate_payload(raw_response_body)) if raw_response_body else ""
+
+                if span is not None and span.is_recording():
+                    span.set_attribute("app.http.response.status_code", response.status_code)
+                    if response_payload:
+                        span.set_attribute("app.http.response.payload", response_payload)
+                        span.add_event("app.http.response.payload", {"payload": response_payload})
+
+                logger.info(
+                    "typing-ml route method=%s path=%s status=%s request=%s response=%s",
+                    request.method,
+                    request.url.path,
+                    response.status_code,
+                    request_payload,
+                    response_payload,
+                )
+
+                return response
+
+            return traced_route_handler
+
+    app.router.route_class = PayloadTracingRoute
+
     if not logging.getLogger().handlers:
         logging.basicConfig(level=os.getenv("TYPING_ML_LOG_LEVEL", "INFO"))
 
     configure_optional_otel(app)
-
-    @app.middleware("http")
-    async def trace_payload_middleware(request: Request, call_next):
-        """Capture request/response payload snippets for logs and optional tracing."""
-
-        raw_request_body = await request.body()
-
-        async def receive() -> dict[str, Any]:
-            return {"type": "http.request", "body": raw_request_body, "more_body": False}
-
-        request_with_body = Request(request.scope, receive)
-        response = await call_next(request_with_body)
-
-        response_chunks = []
-        async for chunk in response.body_iterator:
-            response_chunks.append(chunk)
-        raw_response_body = b"".join(response_chunks)
-
-        request_payload = compact_json_if_possible(truncate_payload(raw_request_body))
-        response_payload = compact_json_if_possible(truncate_payload(raw_response_body))
-
-        try:
-            from opentelemetry import trace
-
-            span = trace.get_current_span()
-            if span is not None and span.is_recording():
-                span.set_attribute("typing.ml.http.method", request.method)
-                span.set_attribute("typing.ml.http.path", request.url.path)
-                span.set_attribute("typing.ml.http.request.payload", request_payload)
-                span.set_attribute("typing.ml.http.response.payload", response_payload)
-                span.set_attribute("typing.ml.http.status_code", response.status_code)
-        except Exception:
-            # Optional OpenTelemetry path; logs still contain payload data.
-            pass
-
-        logger.info(
-            "typing-ml request method=%s path=%s status=%s request=%s response=%s",
-            request.method,
-            request.url.path,
-            response.status_code,
-            request_payload,
-            response_payload,
-        )
-
-        return Response(
-            content=raw_response_body,
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type=response.media_type,
-            background=response.background,
-        )
 
     artifact_store = ArtifactStore()
     model_path, selected_algorithm, active_model_pointer = resolve_runtime_model_selection(artifact_store)
@@ -801,6 +895,9 @@ def create_app() -> FastAPI:
     def train_global() -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
         """Train the global model from the persisted dataset and hot-reload global inference."""
 
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
+
         if not training_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail={"error": "Retraining is already in progress"})
 
@@ -839,6 +936,13 @@ def create_app() -> FastAPI:
                 total_rows_processed=persisted_result.arena_result.total_rows_processed,
                 model_path=persisted_result.model_output_path,
             )
+            log_endpoint_payloads(
+                "train_global",
+                request_payload={},
+                response_payload=response.model_dump(),
+                spans=[request_span],
+                execution_time_ms=(perf_counter() - started_at) * 1000.0,
+            )
             return response
         finally:
             training_lock.release()
@@ -851,6 +955,9 @@ def create_app() -> FastAPI:
     )
     def train_personal(payload: PersonalTrainRequest) -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
         """Train one personalized model from the persisted dataset."""
+
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
 
         if not training_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail={"error": "Retraining is already in progress"})
@@ -894,6 +1001,13 @@ def create_app() -> FastAPI:
                 total_rows_processed=persisted_result.arena_result.total_rows_processed,
                 model_path=persisted_result.model_output_path,
             )
+            log_endpoint_payloads(
+                "train_personal",
+                request_payload=payload.model_dump(),
+                response_payload=response.model_dump(),
+                spans=[request_span],
+                execution_time_ms=(perf_counter() - started_at) * 1000.0,
+            )
             return response
         finally:
             training_lock.release()
@@ -906,7 +1020,17 @@ def create_app() -> FastAPI:
     def health() -> Dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         """Lightweight liveness endpoint."""
 
-        return {"status": "ok"}
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
+        response_payload = {"status": "ok"}
+        log_endpoint_payloads(
+            "health",
+            request_payload={},
+            response_payload=response_payload,
+            spans=[request_span],
+            execution_time_ms=(perf_counter() - started_at) * 1000.0,
+        )
+        return response_payload
 
     @app.get(
         "/metadata",
@@ -919,6 +1043,8 @@ def create_app() -> FastAPI:
         runtime_snapshot = get_runtime_snapshot()
         current_service = runtime_snapshot.inference_service
         current_model = runtime_snapshot.model
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
 
         with start_model_internal_span("typing-ml.model.metadata") as span:
             metadata_payload = current_service.get_metadata()
@@ -929,6 +1055,14 @@ def create_app() -> FastAPI:
                 span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.feature_count", len(feature_names) if feature_names else 0)
                 span.set_attribute("typing.ml.model.class_count", len(classes_list) if classes_list else 0)
+
+            log_endpoint_payloads(
+                "metadata",
+                request_payload={},
+                response_payload=metadata_payload,
+                spans=[request_span, span],
+                execution_time_ms=(perf_counter() - started_at) * 1000.0,
+            )
 
             return metadata_payload
 
@@ -946,6 +1080,10 @@ def create_app() -> FastAPI:
         payload: RetrainRequest | List[TypingSessionTrainingData],
     ) -> TrainOrchestratorResponse:  # pyright: ignore[reportUnusedFunction]
         """Run one retraining cycle and optionally replace runtime inference model."""
+
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
+        request_payload = [row.model_dump() for row in payload] if isinstance(payload, list) else payload.model_dump()
 
         if isinstance(payload, list):
             rows = payload
@@ -1009,6 +1147,13 @@ def create_app() -> FastAPI:
                     random_state=DEFAULT_RETRAIN_RANDOM_STATE,
                     total_rows_processed=arena_result.total_rows_processed,
                 )
+                log_endpoint_payloads(
+                    "train",
+                    request_payload=request_payload,
+                    response_payload=response.model_dump(),
+                    spans=[request_span],
+                    execution_time_ms=(perf_counter() - started_at) * 1000.0,
+                )
                 return response
 
             winner_artifact = ModelArtifact.from_training(
@@ -1064,6 +1209,13 @@ def create_app() -> FastAPI:
                 model_path=production_model_path,
                 active_model_metadata_path=active_model_metadata_path,
             )
+            log_endpoint_payloads(
+                "train",
+                request_payload=request_payload,
+                response_payload=response.model_dump(),
+                spans=[request_span],
+                execution_time_ms=(perf_counter() - started_at) * 1000.0,
+            )
             return response
         finally:
             training_lock.release()
@@ -1081,20 +1233,34 @@ def create_app() -> FastAPI:
 
         requested_user_id = req.user_id.strip() if req.user_id else None
         current_service, current_model, is_fallback_used = resolve_predict_runtime(requested_user_id)
+        request_payload = req.model_dump()
         row_payload = req.row.model_dump()
         feature_count = len(row_payload)
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
 
         with start_model_inference_span("typing-ml.model.predict", row_count=1, feature_count=feature_count) as span:
             result = current_service.predict_one(row_payload)
+            inference_time_ms = (perf_counter() - started_at) * 1000.0
             result["is_fallback_used"] = is_fallback_used
             has_predict_proba = "probabilities" in result
             pred = result.get("prediction")
+
+            log_endpoint_payloads(
+                "predict",
+                request_payload=request_payload,
+                response_payload=result,
+                spans=[request_span, span],
+                execution_time_ms=inference_time_ms,
+                inference_time_ms=inference_time_ms,
+            )
 
             if span is not None and span.is_recording():
                 span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.has_predict_proba", has_predict_proba)
                 span.set_attribute("typing.ml.model.prediction", str(pred))
                 span.set_attribute("typing.ml.model.is_fallback_used", is_fallback_used)
+                span.set_attribute("typing.ml.model.inference_time_ms", inference_time_ms)
                 if requested_user_id:
                     span.set_attribute("typing.ml.model.user_id", requested_user_id)
 
@@ -1111,8 +1277,11 @@ def create_app() -> FastAPI:
         runtime_snapshot = get_runtime_snapshot()
         current_service = runtime_snapshot.inference_service
         current_model = runtime_snapshot.model
+        request_payload = req.model_dump()
         rows_payload = [row.model_dump() for row in req.rows]
         feature_count = len(rows_payload[0]) if rows_payload else 0
+        request_span = get_current_otel_span()
+        started_at = perf_counter()
 
         with start_model_inference_span(
             "typing-ml.model.predict_batch",
@@ -1120,13 +1289,24 @@ def create_app() -> FastAPI:
             feature_count=feature_count,
         ) as span:
             out = current_service.predict_many(rows_payload)
+            inference_time_ms = (perf_counter() - started_at) * 1000.0
             preds = out.get("predictions", [])
             has_predict_proba = "probabilities" in out
+
+            log_endpoint_payloads(
+                "predict_batch",
+                request_payload=request_payload,
+                response_payload=out,
+                spans=[request_span, span],
+                execution_time_ms=inference_time_ms,
+                inference_time_ms=inference_time_ms,
+            )
 
             if span is not None and span.is_recording():
                 span.set_attribute("typing.ml.model.class", current_model.__class__.__name__)
                 span.set_attribute("typing.ml.model.has_predict_proba", has_predict_proba)
                 span.set_attribute("typing.ml.model.prediction_count", len(preds))
+                span.set_attribute("typing.ml.model.inference_time_ms", inference_time_ms)
 
             return out
 
