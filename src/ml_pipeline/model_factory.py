@@ -75,6 +75,13 @@ class ModelPipelineFactory:
                     "xgboost is required for --algorithm xgboost. "
                     "Install dependencies from environment.yml first."
                 ) from ex
-            return xgb.XGBClassifier(random_state=self.random_state)
+            return xgb.XGBClassifier(
+                random_state=self.random_state,
+                learning_rate=0.1,
+                max_depth=6,
+                n_estimators=100,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                )
 
         raise ValueError(f"Unhandled algorithm: {algorithm.value}")
