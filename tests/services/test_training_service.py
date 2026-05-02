@@ -84,6 +84,8 @@ def test_run_algorithm_arena_returns_leaderboard_and_full_data_model() -> None:
     }
     for entry in result.leaderboard:
         assert 0.0 <= entry.accuracy <= 1.0
+        assert 0.0 <= entry.macro_precision <= 1.0
+        assert 0.0 <= entry.macro_recall <= 1.0
         assert 0.0 <= entry.f1_score <= 1.0
         assert entry.execution_time_ms >= 0.0
     assert hasattr(result.retrained_model, "predict")

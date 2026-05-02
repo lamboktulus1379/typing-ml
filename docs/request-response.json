@@ -1,0 +1,15 @@
+{
+    "prediction": "right_pinky",
+    "confidence": 61.503255616650165,
+    "probabilities": {
+        "left_index": 0.00283943568531322,
+        "left_middle": 0.006128072479074553,
+        "left_pinky": 0.3116687009625949,
+        "left_ring": 0.022661754613803074,
+        "right_index": 0.005462878973354067,
+        "right_middle": 0.007461612375660991,
+        "right_pinky": 0.6150325561665017,
+        "right_ring": 0.02874498874369754
+    },
+    "is_fallback_used": true
+}

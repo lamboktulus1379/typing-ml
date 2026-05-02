@@ -63,6 +63,8 @@ class AlgorithmLeaderboardEntry:
 
     name: str
     accuracy: float
+    macro_precision: float
+    macro_recall: float
     f1_score: float
     execution_time_ms: float
     model: Any
@@ -291,12 +293,8 @@ class TrainingArenaService:
             target_series=target_series,
             full_target_series=target_series,
         )
-        macro_precision = float(
-            sk_metrics.precision_score(target_series, winner_predictions, average="macro", zero_division=0)
-        )
-        macro_recall = float(
-            sk_metrics.recall_score(target_series, winner_predictions, average="macro", zero_division=0)
-        )
+        macro_precision = winner.macro_precision
+        macro_recall = winner.macro_recall
         top_predictive_feature = self._extract_top_predictive_feature(retrained_model, list(feature_frame.columns))
         primary_misclassification = self._build_primary_misclassification(target_series, winner_predictions)
         xai_global = self._build_xai_global(
@@ -364,22 +362,11 @@ class TrainingArenaService:
         )
         started_at = perf_counter()
         try:
-            # Macro F1 is the ranking metric for the academic tournament because
-            # it weights each class equally across user-specific telemetry.
-            f1_scores = cross_val_score(
-                self.model_factory.create(algorithm),
-                feature_frame,
-                evaluation_target,
-                cv=DEFAULT_CV_FOLDS,
-                scoring="f1_macro",
-            )
-            # Accuracy is retained as a secondary signal and deterministic tie-break.
-            accuracy_scores = cross_val_score(
-                self.model_factory.create(algorithm),
-                feature_frame,
-                evaluation_target,
-                cv=DEFAULT_CV_FOLDS,
-                scoring="accuracy",
+            predictions = self._cross_validated_predictions(
+                algorithm,
+                feature_frame=feature_frame,
+                target_series=target_series,
+                full_target_series=target_series,
             )
         except ValueError as ex:
             raise ValueError(
@@ -397,12 +384,20 @@ class TrainingArenaService:
         )
         execution_time_ms = ((perf_counter() - started_at) * 1000.0) + fit_execution_time_ms
 
-        accuracy = float(np.mean(accuracy_scores))
-        f1_score = float(np.mean(f1_scores))
+        accuracy = float(sk_metrics.accuracy_score(target_series, predictions))
+        macro_precision = float(
+            sk_metrics.precision_score(target_series, predictions, average="macro", zero_division=0)
+        )
+        macro_recall = float(
+            sk_metrics.recall_score(target_series, predictions, average="macro", zero_division=0)
+        )
+        f1_score = float(sk_metrics.f1_score(target_series, predictions, average="macro", zero_division=0))
 
         return AlgorithmLeaderboardEntry(
             name=algorithm,
             accuracy=accuracy,
+            macro_precision=macro_precision,
+            macro_recall=macro_recall,
             f1_score=f1_score,
             execution_time_ms=execution_time_ms,
             model=model,

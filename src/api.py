@@ -535,24 +535,23 @@ class PersonalTrainRequest(BaseModel):
     rows: List[TypingSessionTrainingData] = Field(default_factory=list)
 
 
-class TrainEvaluationResponse(BaseModel):
-    """Per-algorithm evaluation payload for the .NET orchestrator."""
+class EvaluationResultResponse(BaseModel):
+    """Per-algorithm metrics returned to the frontend evaluation dashboard."""
 
-    algorithmName: str
+    algorithm: str
     accuracy: float
-    f1Score: float
-    executionTimeMs: int
+    macro_precision: float
+    macro_recall: float
+    f1_score: float
 
 
 class TrainOrchestratorResponse(BaseModel):
-    """Exact retraining response contract expected by the .NET orchestrator."""
+    """Retraining response contract for model-comparison and champion display."""
 
-    winningAlgorithmName: str
-    macroPrecision: float
-    macroRecall: float
+    champion_model: str
     topPredictiveFeature: str
     primaryMisclassification: str
-    evaluations: List[TrainEvaluationResponse]
+    evaluation_results: List[EvaluationResultResponse]
     xai_global: Dict[str, Any]
 
 
@@ -583,14 +582,12 @@ def persist_train_report(
         "is_dry_run": is_dry_run,
         "random_state": random_state,
         "target_column": TARGET_COLUMN,
-        "winning_algorithm_name": response.winningAlgorithmName,
-        "macro_precision": response.macroPrecision,
-        "macro_recall": response.macroRecall,
+        "champion_model": response.champion_model,
         "top_predictive_feature": response.topPredictiveFeature,
         "primary_misclassification": response.primaryMisclassification,
         "xai_global": response.xai_global,
         "total_rows_processed": total_rows_processed,
-        "evaluations": [entry.model_dump() for entry in response.evaluations],
+        "evaluation_results": [entry.model_dump() for entry in response.evaluation_results],
         "model_path": model_path,
         "active_model_metadata_path": active_model_metadata_path,
         "report_created_at": datetime.now(timezone.utc).isoformat(),
@@ -731,22 +728,21 @@ def create_app() -> FastAPI:
         return load_inference_service_for_model_path(global_model_path)
 
     def build_train_response(arena_result: Any) -> TrainOrchestratorResponse:
-        evaluations = [
-            TrainEvaluationResponse(
-                algorithmName=entry.name,
+        evaluation_results = [
+            EvaluationResultResponse(
+                algorithm=entry.name,
                 accuracy=entry.accuracy,
-                f1Score=entry.f1_score,
-                executionTimeMs=int(round(entry.execution_time_ms)),
+                macro_precision=entry.macro_precision,
+                macro_recall=entry.macro_recall,
+                f1_score=entry.f1_score,
             )
             for entry in arena_result.leaderboard
         ]
         return TrainOrchestratorResponse(
-            winningAlgorithmName=arena_result.winning_algorithm,
-            macroPrecision=arena_result.macro_precision,
-            macroRecall=arena_result.macro_recall,
+            champion_model=arena_result.winning_algorithm,
             topPredictiveFeature=arena_result.top_predictive_feature,
             primaryMisclassification=arena_result.primary_misclassification,
-            evaluations=evaluations,
+            evaluation_results=evaluation_results,
             xai_global=arena_result.xai_global,
         )
 

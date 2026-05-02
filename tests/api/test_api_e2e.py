@@ -142,12 +142,10 @@ def _assert_xai_global_payload(body: dict[str, object]) -> None:
 
 def _assert_train_response_shape(body: dict[str, object]) -> None:
     assert set(body.keys()) == {
-        "winningAlgorithmName",
-        "macroPrecision",
-        "macroRecall",
+        "champion_model",
         "topPredictiveFeature",
         "primaryMisclassification",
-        "evaluations",
+        "evaluation_results",
         "xai_global",
     }
     _assert_xai_global_payload(body)
@@ -561,28 +559,26 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     assert retrain_response.status_code == 200
     body = retrain_response.json()
     _assert_train_response_shape(body)
-    assert body["winningAlgorithmName"] in {"logistic_regression", "random_forest", "xgboost"}
-    assert 0.0 <= body["macroPrecision"] <= 1.0
-    assert 0.0 <= body["macroRecall"] <= 1.0
+    assert body["champion_model"] in {"logistic_regression", "random_forest", "xgboost"}
     assert body["topPredictiveFeature"] in FEATURE_NAMES
     assert body["primaryMisclassification"]
-    assert len(body["evaluations"]) == 3
-    assert {entry["algorithmName"] for entry in body["evaluations"]} == {
+    assert len(body["evaluation_results"]) == 3
+    assert {entry["algorithm"] for entry in body["evaluation_results"]} == {
         "logistic_regression",
         "random_forest",
         "xgboost",
     }
-    for entry in body["evaluations"]:
-        assert set(entry.keys()) == {"algorithmName", "accuracy", "f1Score", "executionTimeMs"}
+    for entry in body["evaluation_results"]:
+        assert set(entry.keys()) == {"algorithm", "accuracy", "macro_precision", "macro_recall", "f1_score"}
         assert 0.0 <= entry["accuracy"] <= 1.0
-        assert 0.0 <= entry["f1Score"] <= 1.0
-        assert isinstance(entry["executionTimeMs"], int)
-        assert entry["executionTimeMs"] >= 0
+        assert 0.0 <= entry["macro_precision"] <= 1.0
+        assert 0.0 <= entry["macro_recall"] <= 1.0
+        assert 0.0 <= entry["f1_score"] <= 1.0
 
     pointer_path = Path(api_client.app.extra["active_model_metadata_path"])
     assert pointer_path.exists()
     pointer_payload = __import__("json").loads(pointer_path.read_text(encoding="utf-8"))
-    assert pointer_payload["model_algorithm"] == body["winningAlgorithmName"]
+    assert pointer_payload["model_algorithm"] == body["champion_model"]
     assert pointer_payload["model_path"].endswith(".joblib")
     assert "typing-prod-" in pointer_payload["model_path"]
     assert "user-test-1" in pointer_payload["model_path"]
@@ -592,15 +588,15 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
     report_files = sorted(report_dir.glob("train_success_production_*.json"))
     assert report_files
     report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
-    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
+    assert report_payload["champion_model"] == body["champion_model"]
     assert report_payload["total_rows_processed"] == len(retrain_payload)
-    assert len(report_payload["evaluations"]) == 3
+    assert len(report_payload["evaluation_results"]) == 3
     assert report_payload["xai_global"] == body["xai_global"]
 
     metadata_response = api_client.get("/metadata")
     assert metadata_response.status_code == 200
     metadata_body = metadata_response.json()
-    assert metadata_body["model_algorithm"] == body["winningAlgorithmName"]
+    assert metadata_body["model_algorithm"] == body["champion_model"]
     assert metadata_body["model_path"] == pointer_payload["model_path"]
     assert metadata_body["active_model_metadata_path"] == str(pointer_path)
 
@@ -624,8 +620,8 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
     assert response.status_code == 200
     body = response.json()
     _assert_train_response_shape(body)
-    assert len(body["evaluations"]) == 3
-    assert {entry["algorithmName"] for entry in body["evaluations"]} == {
+    assert len(body["evaluation_results"]) == 3
+    assert {entry["algorithm"] for entry in body["evaluation_results"]} == {
         "logistic_regression",
         "random_forest",
         "xgboost",
@@ -637,8 +633,8 @@ def test_train_dry_run_reports_deduplicated_rows_processed(api_client: TestClien
     report_payload = __import__("json").loads(report_files[-1].read_text(encoding="utf-8"))
     assert report_payload["total_rows_processed"] == len(unique_rows)
     assert report_payload["total_rows_processed"] < len(duplicated_rows)
-    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
-    assert len(report_payload["evaluations"]) == 3
+    assert report_payload["champion_model"] == body["champion_model"]
+    assert len(report_payload["evaluation_results"]) == 3
     assert report_payload["xai_global"] == body["xai_global"]
 
 
@@ -661,10 +657,8 @@ def test_train_report_contains_audit_payload(api_client: TestClient) -> None:
 
     assert report_payload["status"] == "success_dry_run"
     assert report_payload["is_dry_run"] is True
-    assert report_payload["winning_algorithm_name"] == body["winningAlgorithmName"]
-    assert len(report_payload["evaluations"]) == 3
-    assert 0.0 <= report_payload["macro_precision"] <= 1.0
-    assert 0.0 <= report_payload["macro_recall"] <= 1.0
+    assert report_payload["champion_model"] == body["champion_model"]
+    assert len(report_payload["evaluation_results"]) == 3
     assert report_payload["xai_global"] == body["xai_global"]
 
 
