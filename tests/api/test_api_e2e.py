@@ -1,6 +1,9 @@
 import importlib
 import importlib.util
+import json
+import logging
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import joblib
@@ -369,6 +372,103 @@ def test_predict_single(api_client: TestClient) -> None:
     assert res.status_code == 200
     body = res.json()
     _assert_predict_response(body, {"left_index", "right_index"})
+
+
+class _FakeSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, object] = {}
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def is_recording(self) -> bool:
+        return True
+
+    def set_attribute(self, key: str, value: object) -> None:
+        self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict[str, object]) -> None:
+        self.events.append((name, attributes))
+
+
+def test_predict_logs_json_payloads_and_records_span_payloads(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api_module = importlib.import_module("src.api")
+    request_span = _FakeSpan()
+    inference_span = _FakeSpan()
+
+    monkeypatch.setattr(api_module, "get_current_otel_span", lambda: request_span)
+
+    @contextmanager
+    def fake_inference_span(span_name: str, row_count: int, feature_count: int):
+        yield inference_span
+
+    monkeypatch.setattr(api_module, "start_model_inference_span", fake_inference_span)
+
+    payload = {"user_id": "user-123", "row": _build_row(0.5)}
+
+    with caplog.at_level(logging.INFO, logger="typing-ml"):
+        res = api_client.post("/predict", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    request_payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    response_payload_json = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    assert f"predict.request payload={request_payload_json}" in caplog.messages
+    assert f"predict.response payload={response_payload_json}" in caplog.messages
+
+    assert request_span.attributes["app.request.payload"] == request_payload_json
+    assert request_span.attributes["app.response.payload"] == response_payload_json
+    assert request_span.attributes["app.inference_time_ms"] >= 0.0
+    assert ("app.request.payload", {"payload": request_payload_json}) in request_span.events
+    assert ("app.response.payload", {"payload": response_payload_json}) in request_span.events
+
+    assert inference_span.attributes["app.request.payload"] == request_payload_json
+    assert inference_span.attributes["app.response.payload"] == response_payload_json
+    assert inference_span.attributes["app.inference_time_ms"] >= 0.0
+
+
+def test_predict_batch_logs_json_payloads_and_records_span_payloads(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api_module = importlib.import_module("src.api")
+    request_span = _FakeSpan()
+    inference_span = _FakeSpan()
+
+    monkeypatch.setattr(api_module, "get_current_otel_span", lambda: request_span)
+
+    @contextmanager
+    def fake_inference_span(span_name: str, row_count: int, feature_count: int):
+        yield inference_span
+
+    monkeypatch.setattr(api_module, "start_model_inference_span", fake_inference_span)
+
+    payload = {"rows": [_build_row(0.5), _build_row(1.5)]}
+
+    with caplog.at_level(logging.INFO, logger="typing-ml"):
+        res = api_client.post("/predict_batch", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    request_payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    response_payload_json = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    assert f"predict_batch.request payload={request_payload_json}" in caplog.messages
+    assert f"predict_batch.response payload={response_payload_json}" in caplog.messages
+
+    assert request_span.attributes["app.request.payload"] == request_payload_json
+    assert request_span.attributes["app.response.payload"] == response_payload_json
+    assert request_span.attributes["app.inference_time_ms"] >= 0.0
+    assert ("app.request.payload", {"payload": request_payload_json}) in request_span.events
+    assert ("app.response.payload", {"payload": response_payload_json}) in request_span.events
+
+    assert inference_span.attributes["app.request.payload"] == request_payload_json
+    assert inference_span.attributes["app.response.payload"] == response_payload_json
+    assert inference_span.attributes["app.inference_time_ms"] >= 0.0
 
 
 def test_predict_batch(api_client: TestClient) -> None:
