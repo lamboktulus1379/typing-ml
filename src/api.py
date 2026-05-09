@@ -647,6 +647,7 @@ class EvaluationResultResponse(BaseModel):
     macro_precision: float
     macro_recall: float
     f1_score: float
+    execution_time_ms: float
 
 
 class TrainOrchestratorResponse(BaseModel):
@@ -829,6 +830,7 @@ def create_app() -> FastAPI:
                 macro_precision=entry.macro_precision,
                 macro_recall=entry.macro_recall,
                 f1_score=entry.f1_score,
+                execution_time_ms=entry.execution_time_ms,
             )
             for entry in arena_result.leaderboard
         ]

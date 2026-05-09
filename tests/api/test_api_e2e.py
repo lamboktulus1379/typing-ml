@@ -669,11 +669,19 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
         "xgboost",
     }
     for entry in body["evaluation_results"]:
-        assert set(entry.keys()) == {"algorithm", "accuracy", "macro_precision", "macro_recall", "f1_score"}
+        assert set(entry.keys()) == {
+            "algorithm",
+            "accuracy",
+            "macro_precision",
+            "macro_recall",
+            "f1_score",
+            "execution_time_ms",
+        }
         assert 0.0 <= entry["accuracy"] <= 1.0
         assert 0.0 <= entry["macro_precision"] <= 1.0
         assert 0.0 <= entry["macro_recall"] <= 1.0
         assert 0.0 <= entry["f1_score"] <= 1.0
+        assert entry["execution_time_ms"] >= 0.0
 
     pointer_path = Path(api_client.app.extra["active_model_metadata_path"])
     assert pointer_path.exists()
