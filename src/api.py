@@ -33,6 +33,44 @@ from fastapi.routing import APIRoute
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(path: str, override: bool = False) -> bool:
+        """Fallback dotenv loader for environments without python-dotenv."""
+
+        if not os.path.exists(path):
+            return False
+
+        loaded_any = False
+        with open(path, encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                normalized_key = key.strip()
+                normalized_value = value.strip().strip("\"'")
+
+                if not override and normalized_key in os.environ:
+                    continue
+
+                os.environ[normalized_key] = normalized_value
+                loaded_any = True
+
+        return loaded_any
+
+
+def load_typing_ml_env() -> None:
+    """Load a local dotenv file before env-derived defaults are resolved."""
+
+    env_file = os.getenv("TYPING_ML_ENV_FILE", ".env")
+    load_dotenv(env_file, override=False)
+
+
+load_typing_ml_env()
+
+try:
     from src.ml_pipeline.artifacts import ArtifactStore, ModelArtifact
     from src.ml_pipeline.constants import (
         ALLOWED_WEAKEST_FINGER_LABELS,
@@ -78,6 +116,43 @@ DEFAULT_MODEL_PATH_BY_ALGORITHM = {
     "random_forest": "models/model_compare_random_forest.joblib",
     "xgboost": "models/model_compare_xgboost.joblib",
 }
+
+
+def resolve_positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    """Read one positive integer environment variable with bounds checking."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError as ex:
+        raise RuntimeError(f"{name} must be an integer, got '{raw_value}'.") from ex
+
+    if parsed_value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {parsed_value}.")
+
+    return parsed_value
+
+
+DEFAULT_RETRAIN_PERSONAL_MIN_ROWS = resolve_positive_int_env(
+    "TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS",
+    20,
+)
+DEFAULT_RETRAIN_MIN_CLASSES = resolve_positive_int_env(
+    "TYPING_ML_RETRAIN_MIN_CLASSES",
+    2,
+)
+DEFAULT_RETRAIN_MIN_SAMPLES_PER_CLASS = resolve_positive_int_env(
+    "TYPING_ML_RETRAIN_MIN_SAMPLES_PER_CLASS",
+    2,
+)
+DEFAULT_RETRAIN_CV_FOLDS = resolve_positive_int_env(
+    "TYPING_ML_RETRAIN_CV_FOLDS",
+    5,
+    minimum=2,
+)
 
 
 @dataclass(frozen=True)
@@ -782,12 +857,18 @@ def create_app() -> FastAPI:
     training_lock = Lock()
     runtime_state = RuntimeInferenceState(inference_service=inference_service, model=model)
     feature_validator = FeatureFrameValidator(FEATURE_RANGE_RULES)
-    target_validator = TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS)
+    target_validator = TargetSeriesValidator(
+        ALLOWED_WEAKEST_FINGER_LABELS,
+        min_classes=DEFAULT_RETRAIN_MIN_CLASSES,
+        min_samples_per_class=DEFAULT_RETRAIN_MIN_SAMPLES_PER_CLASS,
+    )
     training_service = TrainingArenaService(
         model_factory=ModelPipelineFactory(random_state=DEFAULT_RETRAIN_RANDOM_STATE),
         feature_validator=feature_validator,
         target_validator=target_validator,
         random_state=DEFAULT_RETRAIN_RANDOM_STATE,
+        personal_minimum_rows=DEFAULT_RETRAIN_PERSONAL_MIN_ROWS,
+        cv_folds=DEFAULT_RETRAIN_CV_FOLDS,
     )
     training_dataset_path = os.getenv("TYPING_ML_TRAINING_DATASET_PATH", DEFAULT_TRAINING_DATASET_PATH)
 
