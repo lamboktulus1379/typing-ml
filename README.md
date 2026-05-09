@@ -55,8 +55,8 @@ It now follows an "Algorithm Arena" evaluation flow:
 
 1. Normalize and validate the incoming payload.
 2. Remove exact duplicate rows for deterministic reruns.
-3. Split the dataset into 80% train and 20% test with `random_state=42`.
-4. Train and evaluate three candidate algorithms on the same split:
+3. Clean timing outliers that would distort typing behavior.
+4. Train and evaluate three candidate algorithms with stratified K-fold cross validation:
   - `logistic_regression`
   - `random_forest`
   - `xgboost`
@@ -66,15 +66,82 @@ It now follows an "Algorithm Arena" evaluation flow:
   - training execution time in milliseconds
 6. Select the winner by highest macro F1-score.
 7. Retrain the winning algorithm from scratch on 100% of the dataset.
-8. If `user_id` is present, filter the payload to that user before deduplication and before the 80/20 split.
+8. If `user_id` is present, filter the payload to that user before deduplication and before K-fold evaluation.
 9. If `is_dry_run` is `false`, save a new immutable production artifact, update the active-model pointer, and hot-reload the in-memory model.
 
 This gives you two layers of evidence for thesis reporting:
 
-- a fair scientific comparison on a fixed holdout split
+- a fair scientific comparison under the same K-fold protocol
 - a production-ready final model trained on the full available dataset
 
 The `/train` response includes a leaderboard for all three candidate algorithms plus winner metadata.
+
+### Training Data Constraints
+
+FastAPI retraining applies these guardrails by default:
+
+- `/train` requires a non-empty `rows` array.
+- `/train/personal` requires at least `20` rows for the requested user.
+- The target must contain at least `2` classes.
+- Each target class must contain at least `2` rows.
+- K-fold evaluation uses `5` folds by default, so each target class must contain at least `5` rows after deduplication and timing-outlier cleaning.
+
+This means the effective minimum is whichever rule fails first after filtering and cleaning.
+
+### Thesis Demo Override via Environment Variables
+
+For thesis or demo presentations, you can relax the retraining thresholds from environment variables instead of editing Python code.
+
+FastAPI now auto-loads a local `.env` file on startup. By default it looks for `.env` in the current working directory. You can point it at a different file with `TYPING_ML_ENV_FILE`.
+
+Supported variables:
+
+- `TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS` default `20`
+- `TYPING_ML_RETRAIN_MIN_CLASSES` default `2`
+- `TYPING_ML_RETRAIN_MIN_SAMPLES_PER_CLASS` default `2`
+- `TYPING_ML_RETRAIN_CV_FOLDS` default `5`
+
+Example demo override for a smaller personalized retrain:
+
+```env
+TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS=8
+TYPING_ML_RETRAIN_MIN_CLASSES=2
+TYPING_ML_RETRAIN_MIN_SAMPLES_PER_CLASS=2
+TYPING_ML_RETRAIN_CV_FOLDS=2
+```
+
+Important notes:
+
+- FastAPI auto-loads `.env` before retraining defaults are resolved.
+- Use `TYPING_ML_ENV_FILE=/absolute/or/relative/path/to/.env.demo` if you want a non-default env file.
+- `TYPING_ML_RETRAIN_CV_FOLDS` must be at least `2`.
+- If your data only contains one target class, lowering the thresholds still will not produce a meaningful multiclass retrain.
+
+Example using the default `.env` file:
+
+```env
+TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS=8
+TYPING_ML_RETRAIN_MIN_CLASSES=2
+TYPING_ML_RETRAIN_MIN_SAMPLES_PER_CLASS=2
+TYPING_ML_RETRAIN_CV_FOLDS=2
+```
+
+Then run:
+
+```bash
+cd /Users/lamboktulussimamora/Projects/typing-ml
+make dev
+```
+
+Example using `.env.demo` instead:
+
+```bash
+cd /Users/lamboktulussimamora/Projects/typing-ml
+export TYPING_ML_ENV_FILE=.env.demo
+make dev
+```
+
+After the presentation, remove the overrides or set them back to the default production-safe values.
 
 Production artifact behavior:
 - Every non-dry-run training writes a new timestamped artifact under `models/production/`, and personalized retrains inject the user id into the filename.

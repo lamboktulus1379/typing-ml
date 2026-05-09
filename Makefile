@@ -38,7 +38,7 @@ help:
 
 install:
 	$(PYTHON) -m pip install --upgrade pip
-	$(PYTHON) -m pip install fastapi "uvicorn[standard]" pandas scikit-learn joblib matplotlib pytest httpx \
+	$(PYTHON) -m pip install fastapi "uvicorn[standard]" pandas scikit-learn joblib matplotlib pytest httpx python-dotenv \
 		opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
 		opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-requests
 

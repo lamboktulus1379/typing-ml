@@ -111,9 +111,17 @@ class TrainingArenaService:
     feature_validator: FeatureValidatorProtocol
     target_validator: TargetValidatorProtocol
     random_state: int = 42
+    personal_minimum_rows: int = DEFAULT_MIN_PERSONAL_TRAINING_ROWS
+    cv_folds: int = DEFAULT_CV_FOLDS
 
     @classmethod
-    def default(cls, *, random_state: int = 42) -> "TrainingArenaService":
+    def default(
+        cls,
+        *,
+        random_state: int = 42,
+        personal_minimum_rows: int = DEFAULT_MIN_PERSONAL_TRAINING_ROWS,
+        cv_folds: int = DEFAULT_CV_FOLDS,
+    ) -> "TrainingArenaService":
         """Build a default service graph using built-in pipeline components."""
 
         return cls(
@@ -121,6 +129,8 @@ class TrainingArenaService:
             feature_validator=FeatureFrameValidator(FEATURE_RANGE_RULES),
             target_validator=TargetSeriesValidator(ALLOWED_WEAKEST_FINGER_LABELS),
             random_state=random_state,
+            personal_minimum_rows=personal_minimum_rows,
+            cv_folds=cv_folds,
         )
 
     def load_training_dataset(self, data_path: str = DEFAULT_TRAINING_DATASET_PATH) -> pd.DataFrame:
@@ -175,7 +185,11 @@ class TrainingArenaService:
             inline_dataframe=dataframe,
         )
         filtered_dataframe = self._filter_dataframe_for_user(effective_dataframe, user_id=user_id)
-        if len(filtered_dataframe) < minimum_rows:
+        required_minimum_rows = minimum_rows
+        if required_minimum_rows == DEFAULT_MIN_PERSONAL_TRAINING_ROWS:
+            required_minimum_rows = self.personal_minimum_rows
+
+        if len(filtered_dataframe) < required_minimum_rows:
             raise ValueError("Insufficient data")
 
         sanitized_user_id = self._sanitize_user_id_for_path(user_id)
@@ -262,12 +276,12 @@ class TrainingArenaService:
         if not algorithms:
             raise ValueError("No candidate algorithms were configured for retraining.")
 
-        # Stratified 5-fold evaluation requires each class to appear in every fold.
+        # Stratified K-fold evaluation requires each class to appear in every fold.
         minimum_class_rows = int(target_series.value_counts().min())
-        if minimum_class_rows < DEFAULT_CV_FOLDS:
+        if minimum_class_rows < self.cv_folds:
             raise ValueError(
-                "Failed to run 5-fold cross validation. "
-                f"Each class needs at least {DEFAULT_CV_FOLDS} rows. "
+                f"Failed to run {self.cv_folds}-fold cross validation. "
+                f"Each class needs at least {self.cv_folds} rows. "
                 f"Class distribution: {target_series.value_counts().to_dict()}"
             )
 
@@ -370,7 +384,7 @@ class TrainingArenaService:
             )
         except ValueError as ex:
             raise ValueError(
-                "Failed to evaluate candidate algorithms with 5-fold cross validation. "
+                f"Failed to evaluate candidate algorithms with {self.cv_folds}-fold cross validation. "
                 f"Class distribution: {target_series.value_counts().to_dict()}"
             ) from ex
 
@@ -500,7 +514,7 @@ class TrainingArenaService:
             self.model_factory.create(algorithm),
             feature_frame,
             encoded_target,
-            cv=DEFAULT_CV_FOLDS,
+            cv=self.cv_folds,
             method="predict",
         )
         return self._decode_predictions(predictions, label_classes)

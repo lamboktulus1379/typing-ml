@@ -646,6 +646,87 @@ def test_train_personal_rejects_insufficient_rows(api_client: TestClient) -> Non
     assert response.json()["detail"] == "Insufficient data"
 
 
+def test_create_app_allows_lower_personal_threshold_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS", "8")
+
+    if "src.api" in sys.modules:
+        del sys.modules["src.api"]
+    api_module = importlib.import_module("src.api")
+
+    app = api_module.create_app()
+    client = TestClient(app)
+
+    response = client.post("/train/personal", json={"userId": "missing-user"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evaluation_results"]) == 3
+
+
+def test_create_app_loads_retraining_thresholds_from_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.joblib"
+    production_model_dir = tmp_path / "production"
+    active_model_metadata_path = tmp_path / "active_production_model.json"
+    train_reports_dir = tmp_path / "reports"
+    training_dataset_path = tmp_path / "dataset.csv"
+
+    rows = [_build_row(0.0), _build_row(1.0), _build_row(2.0), _build_row(3.0)]
+    labels = ["left_index", "right_index", "left_index", "right_index"]
+    x_train = pd.DataFrame(rows, columns=FEATURE_NAMES)
+
+    clf = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=2000)),
+        ]
+    )
+    clf.fit(x_train, labels)
+
+    artifact = {
+        "model": clf,
+        "model_name": "logistic_regression",
+        "feature_names": FEATURE_NAMES,
+        "target_name": "weakest_finger",
+        "created_at": "2026-03-28T00:00:00+00:00",
+    }
+    joblib.dump(artifact, model_path)
+    pd.DataFrame(_build_dataset_training_rows()).to_csv(training_dataset_path, index=False)
+
+    (tmp_path / ".env").write_text(
+        "TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS=8\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TYPING_ML_RETRAIN_PERSONAL_MIN_ROWS", raising=False)
+    monkeypatch.delenv("TYPING_ML_ENV_FILE", raising=False)
+    monkeypatch.setenv("TYPING_ML_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("TYPING_ML_PRODUCTION_MODEL_DIR", str(production_model_dir))
+    monkeypatch.setenv("TYPING_ML_ACTIVE_MODEL_METADATA_PATH", str(active_model_metadata_path))
+    monkeypatch.setenv("TYPING_ML_TRAIN_REPORTS_DIR", str(train_reports_dir))
+    monkeypatch.setenv("TYPING_ML_TRAINING_DATASET_PATH", str(training_dataset_path))
+    monkeypatch.setenv("TYPING_ML_GLOBAL_FALLBACK_MODEL_PATH", str(tmp_path / "model_production_global.joblib"))
+    monkeypatch.setenv("TYPING_ML_PERSONALIZED_MODEL_PATH_TEMPLATE", str(tmp_path / "model_production_{user_id}.joblib"))
+
+    if "src.api" in sys.modules:
+        del sys.modules["src.api"]
+    api_module = importlib.import_module("src.api")
+
+    app = api_module.create_app()
+    client = TestClient(app)
+
+    response = client.post("/train/personal", json={"userId": "missing-user"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evaluation_results"]) == 3
+
+
 def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) -> None:
     if importlib.util.find_spec("xgboost") is None:
         pytest.skip("xgboost is not installed in this environment")
@@ -669,11 +750,19 @@ def test_train_hot_reloads_model_and_updates_metadata(api_client: TestClient) ->
         "xgboost",
     }
     for entry in body["evaluation_results"]:
-        assert set(entry.keys()) == {"algorithm", "accuracy", "macro_precision", "macro_recall", "f1_score"}
+        assert set(entry.keys()) == {
+            "algorithm",
+            "accuracy",
+            "macro_precision",
+            "macro_recall",
+            "f1_score",
+            "execution_time_ms",
+        }
         assert 0.0 <= entry["accuracy"] <= 1.0
         assert 0.0 <= entry["macro_precision"] <= 1.0
         assert 0.0 <= entry["macro_recall"] <= 1.0
         assert 0.0 <= entry["f1_score"] <= 1.0
+        assert entry["execution_time_ms"] >= 0.0
 
     pointer_path = Path(api_client.app.extra["active_model_metadata_path"])
     assert pointer_path.exists()
