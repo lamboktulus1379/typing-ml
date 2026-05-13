@@ -10,7 +10,112 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ml_pipeline.constants import FINGERS
+try:
+    from .ml_pipeline.constants import FINGERS
+except ImportError:
+    from ml_pipeline.constants import FINGERS
+
+
+SEED_ERROR_COLUMNS = [
+    "ErrorLeftPinky",
+    "ErrorLeftRing",
+    "ErrorLeftMiddle",
+    "ErrorLeftIndex",
+    "ErrorRightIndex",
+    "ErrorRightMiddle",
+    "ErrorRightRing",
+    "ErrorRightPinky",
+]
+
+SEED_DWELL_COLUMNS = [
+    "DwellLeftPinky",
+    "DwellLeftRing",
+    "DwellLeftMiddle",
+    "DwellLeftIndex",
+    "DwellRightIndex",
+    "DwellRightMiddle",
+    "DwellRightRing",
+    "DwellRightPinky",
+]
+
+SEED_FLIGHT_COLUMNS = [
+    "FlightLeftPinky",
+    "FlightLeftRing",
+    "FlightLeftMiddle",
+    "FlightLeftIndex",
+    "FlightRightIndex",
+    "FlightRightMiddle",
+    "FlightRightRing",
+    "FlightRightPinky",
+]
+
+
+def _rounded_normal(
+    rng: np.random.Generator,
+    loc: float,
+    scale: float,
+    size: int,
+    minimum: int,
+) -> np.ndarray:
+    values = np.rint(rng.normal(loc=loc, scale=scale, size=size)).astype(int)
+    return np.clip(values, minimum, None)
+
+
+def build_seed_telemetry_dataframe(
+    user_id: str,
+    row_count: int = 50,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Generate thesis seed telemetry data with fixed schema and outliers."""
+
+    rng = np.random.default_rng(seed)
+    data = {
+        "UserId": [user_id] * row_count,
+        "Sesi": np.arange(1, row_count + 1, dtype=int),
+        "WPM": _rounded_normal(rng, loc=45, scale=5, size=row_count, minimum=1),
+        "Accuracy": rng.uniform(0.85, 0.99, size=row_count),
+    }
+
+    for column in SEED_ERROR_COLUMNS:
+        data[column] = rng.uniform(0.00, 0.05, size=row_count)
+
+    for column in SEED_DWELL_COLUMNS:
+        data[column] = _rounded_normal(rng, loc=100, scale=15, size=row_count, minimum=1)
+
+    for column in SEED_FLIGHT_COLUMNS:
+        data[column] = _rounded_normal(rng, loc=200, scale=30, size=row_count, minimum=1)
+
+    dataframe = pd.DataFrame(data)
+    outlier_rows = dataframe.index[dataframe["Sesi"] % 10 == 0]
+
+    for row_index in outlier_rows:
+        dwell_targets = rng.choice(SEED_DWELL_COLUMNS, size=2, replace=False)
+        flight_targets = rng.choice(SEED_FLIGHT_COLUMNS, size=2, replace=False)
+        dataframe.loc[row_index, dwell_targets] = rng.integers(2500, 5001, size=2)
+        dataframe.loc[row_index, flight_targets] = rng.integers(2500, 5001, size=2)
+
+    dataframe["Accuracy"] = dataframe["Accuracy"].round(4)
+    dataframe[SEED_ERROR_COLUMNS] = dataframe[SEED_ERROR_COLUMNS].round(4)
+
+    ordered_columns = [
+        "UserId",
+        "Sesi",
+        "WPM",
+        "Accuracy",
+        *SEED_ERROR_COLUMNS,
+        *SEED_DWELL_COLUMNS,
+        *SEED_FLIGHT_COLUMNS,
+    ]
+    return dataframe[ordered_columns]
+
+
+def save_dataframe_to_csv(dataframe: pd.DataFrame, output_path: str) -> None:
+    """Persist a dataframe as CSV, creating parent folders when needed."""
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    dataframe.to_csv(output_path, index=False)
 
 
 @dataclass(frozen=True)
@@ -108,10 +213,7 @@ class SyntheticTypingDatasetGenerator:
     def save(self, dataframe: pd.DataFrame) -> None:
         """Persist generated rows as CSV, creating parent folders when needed."""
 
-        output_dir = os.path.dirname(self.config.output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        dataframe.to_csv(self.config.output_path, index=False)
+        save_dataframe_to_csv(dataframe, self.config.output_path)
 
 
 def parse_args() -> argparse.Namespace:
