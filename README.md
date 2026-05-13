@@ -833,3 +833,13 @@ curl -s http://127.0.0.1:8000/predict \
 - Notebooks appear as “modified” after running because outputs are stored inside `.ipynb`.
 ---
 
+# 🏗️ Arsitektur Data Seeding (Hybrid ETL Pipeline)
+
+Untuk menguji ketahanan model Machine Learning terhadap anomali data (*outlier*), sistem ini memerlukan ratusan data telemetri sintetik yang serealistis mungkin. 
+
+Untuk menjaga *Separation of Concerns* dan *Data Lineage*, proses *Data Seeding* dibagi menjadi dua tahap (Pipeline ETL berbasis File):
+
+1. **Extract & Transform (Python):** Python digunakan secara independen sebagai *Data Generator*. Python menghasilkan data untuk **26 fitur biometrik** (WPM, Accuracy, serta Error Rate, Dwell Time, dan Flight Time untuk 8 jari secara individual) berdasarkan Distribusi Gaussian (Normal) agar menyerupai pola pengetikan manusia asli. Python juga menyisipkan *outlier* ekstrem secara sengaja setiap 10 sesi. Hasilnya diekspor sebagai `seed_telemetry.csv`.
+
+2. **Load (.NET 10 EF Core):**
+   Backend .NET bertindak sebagai *Ingestor*. Saat aplikasi dijalankan di *environment* Development/Testing, kelas `DbSeeder.cs` akan membaca file CSV tersebut, melakukan pemetaan ke 26 properti di model C#, dan menyimpannya ke SQL Server (`typing_test`).
