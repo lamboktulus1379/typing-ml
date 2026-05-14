@@ -34,6 +34,7 @@ try:
     )
     from src.ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from src.ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
+    from src.services.training_service import TrainingArenaService
 except ModuleNotFoundError:
     from ml_pipeline.artifacts import ArtifactStore, ModelArtifact
     from ml_pipeline.cleaning import TimingOutlierAnalysis, analyze_preprocessing_outliers
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
     )
     from ml_pipeline.model_factory import Algorithm, ModelPipelineFactory
     from ml_pipeline.validation import FeatureFrameValidator, TargetSeriesValidator
+    from services.training_service import TrainingArenaService
 
 
 logging.basicConfig(
@@ -67,6 +69,7 @@ DEFAULT_MODEL_REGISTRY_DIR = "models/registry"
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_OUTLIER_SAMPLE_SIZE = 10
 OUTLIER_TIME_MS = 5_000
+DEFAULT_TRAINING_ALGORITHMS = tuple(Algorithm.choices())
 
 
 def configure_optional_otel() -> None:
@@ -223,6 +226,19 @@ class DataTrainingRequest(BaseModel):
     task_id: UUID = Field(alias="taskId")
     data_type: str = Field(alias="dataType", pattern="^(real|synthetic)$")
     user_email: str | None = Field(default=None, alias="userEmail")
+    algorithms: list[str] = Field(default_factory=list, alias="algorithms")
+    user_id: str | None = Field(default=None, alias="userId")
+
+
+class DataTrainingModelSummary(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    accuracy: float
+    f1_score: float = Field(alias="f1Score")
+    macro_precision: float = Field(alias="macroPrecision")
+    macro_recall: float = Field(alias="macroRecall")
+    execution_time_ms: float = Field(alias="executionTimeMs")
 
 
 class DataTrainingMetricsResult(BaseModel):
@@ -232,10 +248,16 @@ class DataTrainingMetricsResult(BaseModel):
     algorithm: str
     accuracy: float
     f1_score: float = Field(alias="f1Score")
+    macro_precision: float = Field(alias="macroPrecision")
+    macro_recall: float = Field(alias="macroRecall")
+    top_predictive_feature: str = Field(alias="topPredictiveFeature")
+    primary_misclassification: str = Field(alias="primaryMisclassification")
     total_training_samples_used: int = Field(alias="totalTrainingSamplesUsed")
     saved_to_model_registry: bool = Field(alias="savedToModelRegistry")
     model_registry_path: str = Field(alias="modelRegistryPath")
     classification_report: dict[str, Any] = Field(alias="classificationReport")
+    models: list[DataTrainingModelSummary] = Field(default_factory=list, alias="models")
+    user_id: str | None = Field(default=None, alias="userId")
 
 
 @dataclass(frozen=True)
@@ -253,6 +275,40 @@ class WorkerConfig:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     model_registry_dir: str = DEFAULT_MODEL_REGISTRY_DIR
     random_state: int = DEFAULT_RANDOM_STATE
+
+
+def resolve_training_algorithms(requested: list[str]) -> list[str]:
+    alias_map = {
+        "logisticregression": "logistic_regression",
+        "randomforest": "random_forest",
+        "xgboost": "xgboost",
+    }
+    normalized = [
+        alias_map.get(value.strip().lower(), value.strip().lower())
+        for value in requested
+        if value.strip()
+    ]
+    if not normalized:
+        env_raw = os.getenv("TYPING_ML_DATAOPS_ALGORITHMS") or os.getenv("TYPING_ML_RETRAIN_ALGORITHMS")
+        if env_raw:
+            normalized = [
+                alias_map.get(value.strip().lower(), value.strip().lower())
+                for value in env_raw.split(",")
+                if value.strip()
+            ]
+
+    if not normalized:
+        return list(DEFAULT_TRAINING_ALGORITHMS)
+
+    allowed = set(Algorithm.choices())
+    invalid = sorted(set(normalized) - allowed)
+    if invalid:
+        raise ValueError(
+            "Unsupported algorithms requested: "
+            f"{invalid}. Supported values: {sorted(allowed)}"
+        )
+
+    return normalized
 
 
 class DataOpsWorker:
@@ -525,12 +581,15 @@ class DataOpsWorker:
             if dataframe.empty:
                 raise ValueError("Training dataset is empty after filtering IsOutlier = 0.")
 
-            metrics_result = train_random_forest_from_dataframe(
+            algorithms = resolve_training_algorithms(request.algorithms)
+            metrics_result = train_algorithm_arena_from_dataframe(
                 dataframe,
                 task_id=request.task_id,
                 model_registry_dir=self._config.model_registry_dir,
                 data_type=request.data_type,
                 user_email=request.user_email,
+                user_id=request.user_id,
+                algorithms=algorithms,
                 artifact_store=self._artifact_store,
                 feature_validator=self._feature_validator,
                 target_validator=self._target_validator,
@@ -914,6 +973,84 @@ def train_random_forest_from_dataframe(
         savedToModelRegistry=True,
         modelRegistryPath=str(model_registry_path),
         classificationReport=classification_report,
+    )
+
+
+def train_algorithm_arena_from_dataframe(
+    dataframe: pd.DataFrame,
+    *,
+    task_id: UUID,
+    model_registry_dir: str,
+    data_type: str,
+    user_email: str | None,
+    user_id: str | None,
+    algorithms: list[str],
+    artifact_store: ArtifactStore,
+    feature_validator: FeatureFrameValidator,
+    target_validator: TargetSeriesValidator,
+    model_factory: ModelPipelineFactory,
+    random_state: int,
+) -> DataTrainingMetricsResult:
+    if not algorithms:
+        raise ValueError("At least one training algorithm must be provided.")
+
+    training_service = TrainingArenaService(
+        model_factory=model_factory,
+        feature_validator=feature_validator,
+        target_validator=target_validator,
+        random_state=random_state,
+    )
+
+    arena_result = training_service.run_algorithm_arena(dataframe, algorithms=algorithms)
+
+    normalized_data_type = data_type.strip().lower()
+    if normalized_data_type not in {"real", "synthetic"}:
+        raise ValueError("dataType must be either 'real' or 'synthetic'.")
+
+    lineage_folder = "production" if normalized_data_type == "real" else "experiments"
+    model_directory = Path(model_registry_dir) / lineage_folder
+    model_directory.mkdir(parents=True, exist_ok=True)
+
+    safe_user_email = sanitize_filename_segment(user_email or "unknown_user")
+    timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    model_file_name = f"{arena_result.winning_algorithm}_{normalized_data_type}_{safe_user_email}_{timestamp_utc}.pkl"
+    model_registry_path = (model_directory / model_file_name).resolve()
+
+    artifact = ModelArtifact.from_training(
+        model=arena_result.retrained_model,
+        model_name=arena_result.winning_algorithm,
+        feature_names=TRAIN_FEATURE_COLUMNS,
+        target_name=TARGET_COLUMN,
+    )
+    artifact_store.save_model_artifact(artifact, str(model_registry_path))
+
+    models = [
+        DataTrainingModelSummary(
+            name=entry.name,
+            accuracy=float(entry.accuracy),
+            f1Score=float(entry.f1_score),
+            macroPrecision=float(entry.macro_precision),
+            macroRecall=float(entry.macro_recall),
+            executionTimeMs=float(entry.execution_time_ms),
+        )
+        for entry in arena_result.leaderboard
+    ]
+
+    return DataTrainingMetricsResult(
+        taskId=task_id,
+        algorithm=arena_result.winning_algorithm,
+        accuracy=float(arena_result.winning_accuracy),
+        f1Score=float(arena_result.winning_f1_score),
+        macroPrecision=float(arena_result.macro_precision),
+        macroRecall=float(arena_result.macro_recall),
+        topPredictiveFeature=str(arena_result.top_predictive_feature),
+        primaryMisclassification=str(arena_result.primary_misclassification),
+        totalTrainingSamplesUsed=int(arena_result.total_rows_processed),
+        savedToModelRegistry=True,
+        modelRegistryPath=str(model_registry_path),
+        classificationReport={},
+        models=models,
+        userId=user_id,
     )
 
 
